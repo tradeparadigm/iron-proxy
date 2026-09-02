@@ -19,18 +19,61 @@ var metadataAddresses = []netip.Addr{
 	netip.MustParseAddr("fd20:ce::254"),
 }
 
+// privateRanges are the address ranges a DIME proxy must never be talked into
+// reaching. THIS IS A FORK DELTA, and the most important one in this file.
+//
+// Upstream deliberately excludes RFC1918 from the defaults, because its
+// typical deployment is a company proxying its own traffic and *wanting* to
+// reach private corporate networks. For a DIME proxy the same ranges are our
+// own cluster: the Kubernetes API, the databases, the control plane, and every
+// other customer's agent pod. The proxy exists to let an untrusted workload
+// reach a handful of named venues on the public internet; a request from that
+// workload aimed inward is not a use case, it is the attack.
+//
+// The guard checks the RESOLVED address immediately before connect, so this
+// also stops a hostname that resolves inward — a DNS record the workload
+// controls, or a rebind after the allowlist check.
+//
+// This only covers PROXIED upstream connections. The control-plane client
+// (internal/controlplane) and the AWS SDK clients build their own transports
+// and are not guarded, so config sync and Secrets Manager / KMS still work
+// over private addresses — including VPC endpoints.
+//
+// It is a DEFAULT, not a law: an operator who sets upstream_deny_cidrs
+// replaces this list wholesale (see internal/config). A deployment that truly
+// needs a private destination configures it and says so.
+var privateRanges = []string{
+	// RFC1918.
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	// RFC3927 link-local, in full. The metadata addresses below are pinned
+	// individually by upstream; denying the whole range also closes every
+	// other link-local destination, which a pod has no business reaching.
+	"169.254.0.0/16",
+	// RFC6598 shared address space. Some CNIs and managed control planes
+	// hand out addresses here, so it is private in practice.
+	"100.64.0.0/10",
+	// IPv6 unique-local and link-local. Subsumes the fd00:/fd20: metadata
+	// addresses; both are kept, because a redundant deny costs nothing and a
+	// missing one costs everything.
+	"fc00::/7",
+	"fe80::/10",
+}
+
 // DefaultDenyCIDRs is the secure-default list applied when the operator has
 // not configured upstream_deny_cidrs. It blocks cloud instance metadata
-// endpoints and loopback. RFC1918 is intentionally excluded — many legitimate
-// iron-proxy deployments target private corporate networks.
+// endpoints, loopback, and — see privateRanges, a fork delta — the private
+// ranges that make up our own cluster.
 var DefaultDenyCIDRs = defaultDenyCIDRs()
 
 func defaultDenyCIDRs() []string {
-	cidrs := make([]string, 0, len(metadataAddresses)+2)
+	cidrs := make([]string, 0, len(metadataAddresses)+2+len(privateRanges))
 	for _, address := range metadataAddresses {
 		cidrs = append(cidrs, netip.PrefixFrom(address, address.BitLen()).String())
 	}
-	return append(cidrs, "127.0.0.0/8", "::1/128")
+	cidrs = append(cidrs, "127.0.0.0/8", "::1/128")
+	return append(cidrs, privateRanges...)
 }
 
 // ContainsMetadataAddress reports whether prefix contains a known cloud

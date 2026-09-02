@@ -93,6 +93,13 @@ func (p *Proxy) serveTunnelProxyHTTP(conn net.Conn) error {
 
 // handleTunnelCONNECT handles HTTP CONNECT tunnel requests.
 func (p *Proxy) handleTunnelCONNECT(w http.ResponseWriter, req *http.Request) {
+	// Authenticate the CONNECT itself, before a host is parsed or an upstream
+	// dialed. Everything inside the tunnel that follows rides on this one
+	// check, which is why it is the first thing here.
+	if !p.requireCaller(w, req) {
+		return
+	}
+
 	host := req.Host
 	if _, _, err := net.SplitHostPort(host); err != nil {
 		host = net.JoinHostPort(host, "443")
@@ -141,6 +148,20 @@ func (p *Proxy) handleTunnelCONNECT(w http.ResponseWriter, req *http.Request) {
 // handleSOCKS5 handles SOCKS5 tunnel requests.
 func (p *Proxy) handleSOCKS5(conn net.Conn, br *bufio.Reader) error {
 	defer conn.Close()
+
+	// SOCKS5 here negotiates no-auth only (method 0x00 below), so while
+	// caller authentication is on it would be an anonymous door into the same
+	// credentials every other entry point protects. Refuse it at the method
+	// negotiation, which is the protocol's own way of saying no. RFC 1929
+	// username/password would be more surface than this deployment needs:
+	// agents reach the proxy by CONNECT. See callerauth.go.
+	if p.callerAuth.enabled() {
+		p.logger.Warn("refused a SOCKS5 connection: unsupported while caller authentication is enabled")
+		if err := p.socks5Reply(conn, 0xFF); err != nil {
+			return err
+		}
+		return nil
+	}
 
 	// --- Auth negotiation ---
 	ver, err := br.ReadByte()

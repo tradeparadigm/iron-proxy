@@ -92,23 +92,96 @@ round-trip and fail here); and an AAD that does not match, in either half.
 No error path carries the credential, the data key or the wrapped key. There is
 a test asserting it, because errors become log lines and a log line is forever.
 
-### 2. RFC1918 in the deny CIDRs
+### 2. Caller authentication — `internal/proxy/callerauth.go`
 
-*Pending.* Upstream excludes RFC1918 from `DefaultDenyCIDRs` by design. For a
-proxy running inside our cluster, those ranges are the cluster.
+Upstream does not authenticate its callers: `Proxy-Authorization` appears in
+its source only in the hop-by-hop strip list. Reasonable for a proxy a company
+runs for its own traffic on a network it trusts; not for one holding a single
+customer's live trading credentials next to other customers' agents.
 
-### 3. Caller authentication
+Every caller must present `Proxy-Authorization: Bearer <token>`, compared in
+constant time against `DIME_PROXY_AUTH_TOKEN` **from the pod's environment**.
+Not from the config: in managed mode the config comes from the control plane,
+and a token the control plane chose is one it can use.
 
-*Pending.* `Proxy-Authorization` appears in upstream's source only in the
-hop-by-hop strip list, so a per-customer iron-proxy is otherwise an
-**unauthenticated** proxy holding one customer's credentials. Until this lands,
-NetworkPolicy is the only thing keeping one customer's agent off another's
-proxy — which makes it a prerequisite, not hardening.
+**Why not a transform.** Upstream's intended extension point for this is a
+transform — CONNECT headers are passed to the pipeline for exactly that, and
+its own tests demonstrate a transform answering 407. We did not use it, for two
+reasons. A transform is *configured*, so a control plane that omitted it would
+silently produce an anonymous proxy; and transform ordering would decide
+whether authentication ran before anything else did. In the core it cannot be
+omitted or reordered.
 
-### 4. `label` and `outcome` on every request log line
+Enforced at every front door — CONNECT, absolute-form HTTP on the tunnel
+listener, and the direct http/https listeners — **before** any secret is
+fetched, host matched, or upstream dialled. There is a test asserting the
+upstream is never contacted by an unauthenticated caller.
 
-*Pending.* Needed to tell "injected", "refused, credential not sent" and
-"passed through untouched" apart in an audit.
+Two deliberate asymmetries:
+
+- **Requests inside an established tunnel are not challenged.** Their headers
+  travel end-to-end to the venue, so requiring `Proxy-Authorization` there
+  would mean asking every agent to hand our per-customer token to Binance. The
+  CONNECT is authenticated; the tunnel it opens is trusted. This reads like an
+  omission, so there is a test named after it.
+- **SOCKS5 is refused** (method `0xFF`) while caller auth is on. Upstream
+  negotiates no-auth only, so leaving it reachable would be an anonymous door
+  into the same credentials. RFC 1929 username/password is more surface than
+  this deployment needs — agents arrive by CONNECT.
+
+`Proxy-Authorization` is hop-by-hop and already stripped upstream, so the token
+never reaches a venue. A test pins that too.
+
+**With the variable unset the proxy is unauthenticated** — upstream's
+behaviour, which its suite and standalone users depend on. `New` logs a
+warning at boot naming the risk. A DIME chart must set it; the honest
+improvement is a boot-time refusal once the fork no longer needs to run
+without it.
+
+### 3. RFC1918 in the deny CIDRs — `internal/dnsguard/dnsguard.go`
+
+Upstream's comment states the divergence outright: *"RFC1918 is intentionally
+excluded — many legitimate iron-proxy deployments target private corporate
+networks."* For a DIME proxy those ranges are our own cluster — the Kubernetes
+API, the databases, the control plane, every other customer's agent pod.
+
+Added to the defaults: RFC1918 (`10/8`, `172.16/12`, `192.168/16`), all of
+link-local `169.254/16` (upstream pins only the metadata addresses), shared
+address space `100.64/10`, and IPv6 `fc00::/7` + `fe80::/10`. The guard checks
+the **resolved** address immediately before connect, so this also catches a
+hostname that resolves inward.
+
+This covers **proxied upstream connections only**. `internal/controlplane` and
+the AWS SDK clients build their own transports and are not guarded, so config
+sync and Secrets Manager / KMS still work over private addresses, including VPC
+endpoints. It is also a *default*: an operator who sets `upstream_deny_cidrs`
+replaces the list wholesale.
+
+The test asserts `10.56.35.116` is denied, which is a real pod address in our
+cluster — a regression there would let one customer's agent reach another's.
+
+### 4. `label` and `outcome` on the request annotations
+
+Upstream already annotates `swapped`, `injected`, `rejected` and
+`reject_reason`. Two things were missing for an audit.
+
+**`label`** — the existing `secret` field is `Source.Name()`, the AWS resource
+id (`terminal/prod/<account>/binance-1fbd3c58`). An audit read by a person
+needs the name the person chose. `kms_sm` sources carry it via a `Label()`
+method the transform picks up through an anonymous interface assertion, so no
+other source type grows a field it does not have, and the config does not
+repeat the label in two places.
+
+**`outcome`** — annotated on **every** request, with a closed set:
+`rejected`, `injected`, `swapped`, `injected+swapped`, `passthrough`. The last
+one is the point: "this request went upstream with nothing of ours in it"
+previously existed only as the *absence* of three other fields, which is
+neither greppable nor alertable.
+
+The `require`-mode rejection with no placeholder present also gained
+`reject_reason: placeholder_absent`. That refusal is what stops a workload
+bypassing the swap with a credential of its own, so it deserves a name rather
+than a bare `rejected`.
 
 ## Incidental: dependency versions
 

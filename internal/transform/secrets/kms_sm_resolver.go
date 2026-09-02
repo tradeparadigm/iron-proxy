@@ -180,10 +180,28 @@ func (r *kmsSMBuilder) Build(raw yaml.Node) (secretSource, error) {
 
 	// The display name is the secret id, matching aws_sm. It names an AWS
 	// resource, never a credential, so it is safe in a log line.
-	return buildLazySource(cfg.SecretID, cfg.TTL, cfg.FailureTTL, r.logger, func(ctx context.Context) (string, error) {
+	src, err := buildLazySource(cfg.SecretID, cfg.TTL, cfg.FailureTTL, r.logger, func(ctx context.Context) (string, error) {
 		return r.fetchAndOpen(ctx, cfg, namespace, keyID)
 	})
+	if err != nil {
+		return nil, err
+	}
+	// Carry the label alongside. The secret id is what an operator greps in
+	// AWS; the label is what the user called the credential, and it is the
+	// only one of the two that means anything in an audit read by a human.
+	return labeledSource{Source: src, label: cfg.Label}, nil
 }
+
+// labeledSource attaches an operator-facing name to a source. The secrets
+// transform picks it up through an anonymous interface assertion, so no other
+// source type has to grow a label it does not have.
+type labeledSource struct {
+	Source
+	label string
+}
+
+// Label is the credential's user-chosen name.
+func (l labeledSource) Label() string { return l.label }
 
 // fetchAndOpen reads the envelope and opens it. Every error path names the
 // secret and the reason and NOTHING else: the wrapped key, the data key and

@@ -182,3 +182,47 @@ func TestDialControl_NilGuardNoop(t *testing.T) {
 	var g *Guard
 	require.NoError(t, g.DialControl("tcp", "127.0.0.1:443", nil))
 }
+
+// The fork delta. Upstream leaves RFC1918 out of the defaults on purpose,
+// because its users want to reach corporate networks. For a proxy running
+// inside our cluster those ranges ARE the cluster, so an agent must not be
+// able to talk this proxy into reaching them.
+//
+// The addresses below are not arbitrary: 10.56.x.x is where our pods actually
+// live, so a regression here would let one customer's agent reach another's.
+func TestDefaultDenyCIDRsCoverThePrivateSpace(t *testing.T) {
+	g, err := New(DefaultDenyCIDRs)
+	require.NoError(t, err)
+
+	denied := []string{
+		"10.56.35.116",    // a real pod address in our cluster
+		"10.0.0.5",        // the plan's exit test
+		"172.16.4.9",      // RFC1918 middle block
+		"192.168.1.1",     // RFC1918 home block
+		"169.254.169.254", // instance metadata
+		"169.254.1.1",     // the rest of link-local, which upstream allowed
+		"100.64.0.1",      // shared address space
+		"127.0.0.1",       // loopback
+		"::1",             // loopback, v6
+		"fd00:ec2::254",   // metadata, v6
+		"fc00::1",         // unique-local
+		"fe80::1",         // link-local, v6
+	}
+	for _, addr := range denied {
+		t.Run("deny "+addr, func(t *testing.T) {
+			ip, err := netip.ParseAddr(addr)
+			require.NoError(t, err)
+			require.True(t, g.IsDenied(ip), "%s must be denied by default", addr)
+		})
+	}
+
+	// And the public internet still works, or the proxy is useless.
+	allowed := []string{"52.84.1.1", "1.1.1.1", "2606:4700::1111"}
+	for _, addr := range allowed {
+		t.Run("allow "+addr, func(t *testing.T) {
+			ip, err := netip.ParseAddr(addr)
+			require.NoError(t, err)
+			require.False(t, g.IsDenied(ip), "%s must still be reachable", addr)
+		})
+	}
+}

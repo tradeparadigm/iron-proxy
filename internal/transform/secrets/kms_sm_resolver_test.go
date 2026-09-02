@@ -338,3 +338,29 @@ func TestKMSSMIsRegistered(t *testing.T) {
 	_, ok := defaultRegistry(nil)["kms_sm"]
 	assert.True(t, ok, "kms_sm must be in the default source registry")
 }
+
+// ─── Audit fields ───────────────────────────────────────────────────────────
+
+// The secret id names an AWS resource; the label is what the user called the
+// credential. An audit read by a person needs the second one.
+func TestKMSSMCarriesTheLabelForAudit(t *testing.T) {
+	k := &fakeKMS{dataKey: mustDecode(t, vectorDataKeyB64)}
+	src, err := sourceFor(t, envelopeJSON(t, nil), k, nil, "")
+	require.NoError(t, err)
+
+	l, ok := src.(interface{ Label() string })
+	require.True(t, ok, "a kms_sm source must expose its label to the transform")
+	assert.Equal(t, vectorLabel, l.Label())
+
+	// And the display name stays the AWS resource, so diagnostics keep it.
+	assert.Equal(t, testSecretID, src.Name())
+}
+
+func TestRequestOutcome(t *testing.T) {
+	// A closed set, so a log pipeline can enumerate it — and passthrough is
+	// the one that previously existed only as the absence of other fields.
+	assert.Equal(t, outcomePassthrough, requestOutcome(false, false))
+	assert.Equal(t, outcomeInjected, requestOutcome(true, false))
+	assert.Equal(t, outcomeSwapped, requestOutcome(false, true))
+	assert.Equal(t, outcomeBoth, requestOutcome(true, true))
+}

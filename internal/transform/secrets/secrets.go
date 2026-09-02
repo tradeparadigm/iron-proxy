@@ -332,8 +332,19 @@ func (s *Secrets) Name() string { return "secrets" }
 
 func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
 	type secretRecord struct {
-		Secret    string   `json:"secret"`
+		Secret string `json:"secret"`
+		// Label is the credential's user-chosen name, when its source has one
+		// (see labeledSource). Secret names an AWS resource; an audit read by
+		// a person needs the name the person chose.
+		Label     string   `json:"label,omitempty"`
 		Locations []string `json:"locations"`
+	}
+	// labelOf reads the optional operator-facing name off a source.
+	labelOf := func(src Source) string {
+		if l, ok := src.(interface{ Label() string }); ok {
+			return l.Label()
+		}
+		return ""
 	}
 	var swapped, injected []secretRecord
 	var unavailable []string
@@ -348,7 +359,9 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		if err != nil {
 			if sec.require {
 				tctx.Annotate("rejected", name)
+				tctx.Annotate("label", labelOf(sec.source))
 				tctx.Annotate("reject_reason", "secret_unavailable")
+				tctx.Annotate("outcome", outcomeRejected)
 				return &transform.TransformResult{Action: transform.ActionReject}, nil
 			}
 			unavailable = append(unavailable, name)
@@ -361,7 +374,7 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 				return nil, fmt.Errorf("injecting secret %q: %w", name, err)
 			}
 			if len(locations) > 0 {
-				injected = append(injected, secretRecord{Secret: name, Locations: locations})
+				injected = append(injected, secretRecord{Secret: name, Label: labelOf(sec.source), Locations: locations})
 			}
 			continue
 		}
@@ -386,9 +399,17 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		}
 
 		if len(locations) > 0 {
-			swapped = append(swapped, secretRecord{Secret: name, Locations: locations})
+			swapped = append(swapped, secretRecord{Secret: name, Label: labelOf(sec.source), Locations: locations})
 		} else if sec.require {
+			// require + nothing matched: the workload sent a request to a
+			// credentialed host WITHOUT the placeholder. Refusing is the
+			// point — it stops a workload bypassing the swap with a
+			// credential of its own — so the reason is worth naming, not
+			// just the rejection.
 			tctx.Annotate("rejected", name)
+			tctx.Annotate("label", labelOf(sec.source))
+			tctx.Annotate("reject_reason", "placeholder_absent")
+			tctx.Annotate("outcome", outcomeRejected)
 			return &transform.TransformResult{Action: transform.ActionReject}, nil
 		}
 	}
@@ -402,8 +423,45 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 	if len(unavailable) > 0 {
 		tctx.Annotate("secret_unavailable", unavailable)
 	}
+	// outcome is annotated on EVERY request, including the ones this
+	// transform did nothing to. An audit has to be able to group and alert on
+	// "a credential left the proxy" versus "it did not", and a state that
+	// exists only as the absence of three other fields is neither greppable
+	// nor alertable. passthrough is the value that was previously unsayable.
+	tctx.Annotate("outcome", requestOutcome(len(injected) > 0, len(swapped) > 0))
 
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+}
+
+// Outcome values. A closed set, so a log pipeline can enumerate them.
+const (
+	// outcomeRejected: the request did not go upstream.
+	outcomeRejected = "rejected"
+	// outcomeInjected: the proxy attached a credential the client never sent.
+	outcomeInjected = "injected"
+	// outcomeSwapped: the proxy replaced a placeholder the client did send.
+	outcomeSwapped = "swapped"
+	// outcomeBoth: one request carried both, which is legal with several
+	// entries matching one host. Kept as its own value rather than picking a
+	// winner, because "which" would then be a lie.
+	outcomeBoth = "injected+swapped"
+	// outcomePassthrough: the request went upstream with nothing of ours in
+	// it. The value that matters most for an audit, and the one that used to
+	// be invisible.
+	outcomePassthrough = "passthrough"
+)
+
+func requestOutcome(injected, swapped bool) string {
+	switch {
+	case injected && swapped:
+		return outcomeBoth
+	case injected:
+		return outcomeInjected
+	case swapped:
+		return outcomeSwapped
+	default:
+		return outcomePassthrough
+	}
 }
 
 func (s *Secrets) injectSecret(req *http.Request, sec *resolvedSecret, realValue string) ([]string, error) {

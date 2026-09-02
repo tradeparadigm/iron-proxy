@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +53,10 @@ type Proxy struct {
 	mcpGateway           *mcpgateway.Holder
 	responseRetryHandler *responseretry.Handler
 	logger               *slog.Logger
+
+	// callerAuth is the DIME fork's per-customer caller check. Nil means
+	// unauthenticated — see callerauth.go.
+	callerAuth *callerAuth
 
 	// shutdownCtx is canceled by Shutdown to unblock in-flight TCP-passthrough
 	// connections that would otherwise sit on blocking Reads.
@@ -127,6 +132,16 @@ func New(opts Options) *Proxy {
 		logger:               opts.Logger,
 		shutdownCtx:          shutdownCtx,
 		shutdownCancel:       shutdownCancel,
+		callerAuth:           newCallerAuth(os.Getenv),
+	}
+	if !p.callerAuth.enabled() && p.logger != nil {
+		// Not fatal: upstream runs without it, and so do its tests. But a
+		// DIME deployment that reaches here is an anonymous proxy holding one
+		// customer's credentials, with nothing but NetworkPolicy between it
+		// and every other agent in the cluster. Say so at boot, where someone
+		// reads it, rather than leaving it to be discovered.
+		p.logger.Warn("caller authentication is DISABLED: any client that can reach this proxy can use its credentials",
+			slog.String("set", envCallerToken))
 	}
 
 	p.httpServer = &http.Server{
@@ -304,6 +319,13 @@ func (p *Proxy) handleDirectHTTP(w http.ResponseWriter, r *http.Request) {
 // handleHTTP is the core HTTP request handler. tunnelInfo is non-nil only
 // when r originated inside a CONNECT/SOCKS5 tunnel.
 func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *transform.TunnelInfo) {
+	// Front door only. A request arriving inside a tunnel was authenticated
+	// when its CONNECT was accepted, and its Proxy-Authorization header — if
+	// it had one — would be travelling end-to-end to the venue. See
+	// callerauth.go.
+	if tunnelInfo == nil && !p.requireCaller(w, r) {
+		return
+	}
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
