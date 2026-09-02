@@ -183,6 +183,39 @@ The `require`-mode rejection with no placeholder present also gained
 bypassing the swap with a credential of its own, so it deserves a name rather
 than a bare `rejected`.
 
+### 5. `Dockerfile` — a build from source
+
+Upstream's `Dockerfile.release` is goreleaser's: it copies a binary
+goreleaser has already cross-compiled into `linux/${TARGETARCH}/`, and the
+pipeline producing it needs a goreleaser-pro licence and Docker Hub
+credentials. Neither is available to the DIME build, and neither should be
+required to ship a fork.
+
+`Dockerfile` (new, additive — `Dockerfile.release` and `.goreleaser.yml` are
+untouched, so a `v*` tag still publishes `ironsh/iron-proxy` exactly as
+before) builds from the checkout with `go build`, stamps
+`internal/version.Version` with the fork commit sha, and lands on
+`gcr.io/distroless/static-debian12:nonroot`.
+
+**Distroless rather than alpine**, which is what `Dockerfile.release` uses:
+this process holds decrypted trading credentials in memory, and there is no
+reason for a shell and a package manager to share its filesystem. It takes its
+whole configuration from the control plane and its environment, so it needs
+neither.
+
+**Consequence for the deployment:** `:nonroot` is uid 65532 and cannot bind
+ports below 1024. The DIME chart therefore puts every listener above 1024, and
+upstream chart's `NET_BIND_SERVICE` capability is not needed. Do not "fix" a
+bind failure by adding the capability back — move the port.
+
+**Who builds it.** dime-terminal's `infra/jenkins/Jenkinsfile.terminal-openclaw`,
+the same job that rolls the customer fleet: it resolves this repository's
+`dime` branch to a sha, builds `terminal/iron-proxy:dime-<sha12>` into ECR if
+that tag is not already there, and deploys it in the same run. There is
+deliberately no published image for this fork and no second pipeline —
+a public iron-proxy image would be one without `kms_sm` or caller auth, which
+is a silent removal of the two properties this fork exists for.
+
 ## Incidental: dependency versions
 
 Adding the KMS client moved `aws-sdk-go-v2` 1.41.11 → 1.45.1 and `smithy-go`
