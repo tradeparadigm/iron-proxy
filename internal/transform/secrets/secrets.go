@@ -147,6 +147,7 @@ func defaultRegistry(logger *slog.Logger) sourceBuilderRegistry {
 		"file":              newFileBuilder(logger),
 		"control_plane":     newControlPlaneBuilder(logger),
 		"aws_sm":            newAWSSMBuilder(logger),
+		"kms_sm":            newKMSSMBuilder(logger),
 		"aws_ssm":           newAWSSSMBuilder(logger),
 		"1password":         newOPBuilder(logger),
 		"1password_connect": newOPConnectBuilder(logger),
