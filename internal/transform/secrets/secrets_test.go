@@ -1590,3 +1590,76 @@ func TestSecrets_MITMConnectPreflightIsSkipped(t *testing.T) {
 		require.Equal(t, transform.ActionReject, res.Action)
 	})
 }
+
+// TestSecrets_MultipleEntriesOneDestination pins what happens when more than
+// one secret matches the same host — an inject and a replace, say, both scoped
+// to api.openai.com.
+//
+// ALL matching entries run, in config order. The loop has no break and exits
+// early only to reject, so matching is not first-wins: two credentials for one
+// venue both apply, which is what a user enrolling separate key and signature
+// credentials for the same exchange would expect.
+//
+// Combined with the CONNECT pre-flight skip, the shape is: at stage one none of
+// them run, at stage two all of them do.
+func TestSecrets_MultipleEntriesOneDestination(t *testing.T) {
+	entries := []secretEntry{
+		{
+			Source: envSource("OPENAI_API_KEY"),
+			Rules:  []hostmatch.RuleConfig{{Host: "api.openai.com"}},
+			Inject: &injectConfig{Header: "X-Api-Key", Require: true},
+		},
+		{
+			Source:       envSource("ANTHROPIC_API_KEY"),
+			ProxyValue:   "proxy-other-xyz789",
+			MatchHeaders: []string{"Authorization"},
+			Rules:        []hostmatch.RuleConfig{{Host: "api.openai.com"}},
+			Require:      true,
+		},
+	}
+
+	t.Run("both apply to the real request", func(t *testing.T) {
+		s := makeSecrets(t, entries)
+
+		req := openaiReq("GET", "/v1/chat")
+		req.Header.Set("Authorization", "Bearer proxy-other-xyz789")
+
+		res, err := s.TransformRequest(context.Background(),
+			&transform.TransformContext{Mode: transform.ModeMITM}, req)
+		require.NoError(t, err)
+		require.Equal(t, transform.ActionContinue, res.Action)
+
+		// The inject entry contributed a header that was not there...
+		require.Equal(t, "sk-real-openai-key", req.Header.Get("X-Api-Key"))
+		// ...and the replace entry swapped one that was.
+		require.Equal(t, "Bearer sk-real-anthropic-key", req.Header.Get("Authorization"))
+	})
+
+	t.Run("neither applies to the CONNECT pre-flight", func(t *testing.T) {
+		s := makeSecrets(t, entries)
+
+		req := httptest.NewRequest(http.MethodConnect, "http://api.openai.com:443", nil)
+		req.Host = "api.openai.com:443"
+
+		res, err := s.TransformRequest(context.Background(),
+			&transform.TransformContext{Mode: transform.ModeMITM}, req)
+		require.NoError(t, err)
+		require.Equal(t, transform.ActionContinue, res.Action,
+			"the replace entry's require must not reject the whole connection")
+		require.Empty(t, req.Header.Get("X-Api-Key"),
+			"the inject entry must not resolve its secret onto a discarded request")
+	})
+
+	t.Run("one entry's require still rejects the real request", func(t *testing.T) {
+		// The mixed set does not soften require: a real request missing the
+		// replace entry's placeholder is refused even though the inject entry
+		// beside it applied cleanly.
+		s := makeSecrets(t, entries)
+
+		req := openaiReq("GET", "/v1/chat") // no Authorization header at all
+		res, err := s.TransformRequest(context.Background(),
+			&transform.TransformContext{Mode: transform.ModeMITM}, req)
+		require.NoError(t, err)
+		require.Equal(t, transform.ActionReject, res.Action)
+	})
+}
