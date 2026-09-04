@@ -331,6 +331,41 @@ func validateInject(i int, cfg *injectConfig) error {
 func (s *Secrets) Name() string { return "secrets" }
 
 func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
+	// The MITM CONNECT pre-flight is not a request this transform can act on.
+	//
+	// An HTTPS request through the tunnel is seen TWICE. First as a CONNECT
+	// carrying nothing but a destination — no method, path, application headers
+	// or body, because they are still inside a TLS session that has not been
+	// negotiated yet. Then, after the proxy terminates that TLS, as the real
+	// request with everything present.
+	//
+	// The pipeline runs at both points, and at the first one every question
+	// this transform asks is unanswerable:
+	//
+	//   - replace + require REJECTED every such connection, because it looked
+	//     for its proxy_value in a request that cannot carry one and treated
+	//     absence as the workload trying to bypass the swap. A replace secret
+	//     was therefore unusable through the tunnel: 403 on CONNECT, and the
+	//     real request never got a chance to present the placeholder it had.
+	//   - inject FETCHED AND DECRYPTED the secret to write it onto a synthetic
+	//     request that is then discarded — a KMS call and a plaintext secret in
+	//     memory per connection, for a mutation nothing reads.
+	//
+	// Continuing here costs no enforcement: the real request runs the identical
+	// code path a moment later with its headers, body and path intact, so
+	// require still refuses a workload that omits the placeholder, and inject
+	// still attaches the secret. It just happens where the answer means
+	// something.
+	//
+	// SNI-only mode is deliberately NOT skipped. There, the synthetic host-only
+	// request is the only one there will ever be — the proxy peeks the SNI and
+	// passes the encrypted stream through untouched — so the check here is the
+	// only check, and require refusing a credentialed host it cannot inject
+	// into is the honest outcome rather than a false negative.
+	if tctx != nil && tctx.Mode == transform.ModeMITM && req.Method == http.MethodConnect {
+		return &transform.TransformResult{Action: transform.ActionContinue}, nil
+	}
+
 	type secretRecord struct {
 		Secret string `json:"secret"`
 		// Label is the credential's user-chosen name, when its source has one

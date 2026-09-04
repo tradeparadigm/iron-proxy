@@ -1505,3 +1505,88 @@ func TestLazy_FailureCachedAcrossRequests(t *testing.T) {
 	require.Equal(t, 1, fr.fetchCalls["MISSING"])
 }
 
+
+// TestSecrets_MITMConnectPreflightIsSkipped covers the two-stage shape of an
+// HTTPS request through the tunnel.
+//
+// The pipeline runs first against a CONNECT that carries only a destination —
+// no method, path, application headers or body, because they are still inside a
+// TLS session that has not been negotiated — and then again against the real
+// request once the proxy has terminated that TLS.
+//
+// Asking this transform anything at the first point is unanswerable. A replace
+// secret with require would reject every connection to a credentialed host,
+// because its proxy_value cannot appear in a CONNECT and absence is read as the
+// workload trying to bypass the swap. That made replace secrets unusable
+// through the tunnel: 403 on CONNECT, and the real request never got to present
+// the placeholder it was carrying.
+func TestSecrets_MITMConnectPreflightIsSkipped(t *testing.T) {
+	t.Run("require does not reject the CONNECT", func(t *testing.T) {
+		s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+			e.Require = true
+		})})
+
+		// What the proxy synthesizes before opening the tunnel: destination
+		// only. No Authorization header exists yet to hold the placeholder.
+		req := httptest.NewRequest(http.MethodConnect, "http://api.openai.com:443", nil)
+		req.Host = "api.openai.com:443"
+
+		res, err := s.TransformRequest(context.Background(),
+			&transform.TransformContext{Mode: transform.ModeMITM}, req)
+		require.NoError(t, err)
+		require.Equal(t, transform.ActionContinue, res.Action,
+			"rejecting here makes every replace secret unusable through the tunnel")
+	})
+
+	t.Run("the real request that follows is still enforced", func(t *testing.T) {
+		// Skipping the pre-flight costs no enforcement, which is the whole
+		// reason it is safe: the same code runs on the real request.
+		s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+			e.Require = true
+		})})
+
+		req := openaiReq("GET", "/v1/chat") // no placeholder anywhere
+		res, err := s.TransformRequest(context.Background(),
+			&transform.TransformContext{Mode: transform.ModeMITM}, req)
+		require.NoError(t, err)
+		require.Equal(t, transform.ActionReject, res.Action,
+			"a workload reaching a credentialed host without the placeholder must still be refused")
+	})
+
+	t.Run("the CONNECT does not fetch the secret", func(t *testing.T) {
+		// Inject used to resolve and decrypt its secret in order to write it
+		// onto a synthetic request that is then thrown away — a KMS call and a
+		// plaintext secret in memory per connection, for a mutation nothing
+		// reads.
+		s := makeSecrets(t, []secretEntry{{
+			Source: envSource("OPENAI_API_KEY"),
+			Rules:  []hostmatch.RuleConfig{{Host: "api.openai.com"}},
+			Inject: &injectConfig{Header: "Authorization", Require: true},
+		}})
+
+		req := httptest.NewRequest(http.MethodConnect, "http://api.openai.com:443", nil)
+		req.Host = "api.openai.com:443"
+
+		res, err := s.TransformRequest(context.Background(),
+			&transform.TransformContext{Mode: transform.ModeMITM}, req)
+		require.NoError(t, err)
+		require.Equal(t, transform.ActionContinue, res.Action)
+		require.Empty(t, req.Header.Get("Authorization"),
+			"nothing should be written onto a request that is discarded")
+	})
+
+	t.Run("sni-only is NOT skipped", func(t *testing.T) {
+		// There the synthetic host-only request is the only one there will
+		// ever be, so this check is the only check. require refusing a
+		// credentialed host it cannot inject into is the honest outcome.
+		s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+			e.Require = true
+		})})
+
+		req := openaiReq("GET", "/")
+		res, err := s.TransformRequest(context.Background(),
+			&transform.TransformContext{Mode: transform.ModeSNIOnly}, req)
+		require.NoError(t, err)
+		require.Equal(t, transform.ActionReject, res.Action)
+	})
+}
