@@ -393,11 +393,21 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		realValue, err := sec.source.Get(ctx)
 		if err != nil {
 			if sec.require {
+				label := labelOf(sec.source)
 				tctx.Annotate("rejected", name)
-				tctx.Annotate("label", labelOf(sec.source))
+				tctx.Annotate("label", label)
 				tctx.Annotate("reject_reason", "secret_unavailable")
 				tctx.Annotate("outcome", outcomeRejected)
-				return &transform.TransformResult{Action: transform.ActionReject}, nil
+				// The fetch error itself stays HERE, in the log the operator
+				// reads. It can name a secret identifier, an IAM denial or a
+				// KMS failure, none of which the agent needs and some of which
+				// it should not be handed.
+				tctx.Annotate("fetch_error", err.Error())
+				return &transform.TransformResult{
+					Action: transform.ActionReject,
+					Response: rejection(req, "secret_unavailable", label,
+						secretUnavailableBody(rejectionHost(req), label)),
+				}, nil
 			}
 			unavailable = append(unavailable, name)
 			continue
@@ -441,11 +451,20 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 			// point — it stops a workload bypassing the swap with a
 			// credential of its own — so the reason is worth naming, not
 			// just the rejection.
+			//
+			// This is also the ONE refusal the caller can fix, so it carries
+			// the placeholder and the positions scanned. See reject.go for why
+			// that is safe to hand over and why an opaque 403 was not.
+			label := labelOf(sec.source)
 			tctx.Annotate("rejected", name)
-			tctx.Annotate("label", labelOf(sec.source))
+			tctx.Annotate("label", label)
 			tctx.Annotate("reject_reason", "placeholder_absent")
 			tctx.Annotate("outcome", outcomeRejected)
-			return &transform.TransformResult{Action: transform.ActionReject}, nil
+			return &transform.TransformResult{
+				Action: transform.ActionReject,
+				Response: rejection(req, "placeholder_absent", label,
+					placeholderAbsentBody(rejectionHost(req), label, &sec)),
+			}, nil
 		}
 	}
 

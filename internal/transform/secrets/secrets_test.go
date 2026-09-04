@@ -1505,7 +1505,6 @@ func TestLazy_FailureCachedAcrossRequests(t *testing.T) {
 	require.Equal(t, 1, fr.fetchCalls["MISSING"])
 }
 
-
 // TestSecrets_MITMConnectPreflightIsSkipped covers the two-stage shape of an
 // HTTPS request through the tunnel.
 //
