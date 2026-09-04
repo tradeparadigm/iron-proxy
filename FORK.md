@@ -1,7 +1,15 @@
 # FORK.md — the DIME fork of iron-proxy
 
-Fork of [`ironsh/iron-proxy`](https://github.com/ironsh/iron-proxy), branch
-`dime`. Upstream stays the source of truth for everything not listed here.
+Fork of [`ironsh/iron-proxy`](https://github.com/ironsh/iron-proxy). Our
+deployable branch is `main`, like any other repository we own — upstream is
+reached through a remote, not through a branch of the same name. Upstream stays
+the source of truth for everything not listed here.
+
+`dime` is kept as an alias of `main` so older references still resolve; it is
+not maintained separately, and the two will diverge only by mistake. The
+`dime-<sha12>` image tag is unrelated to either name: it means "a build of this
+fork", and it stays as it is because every proxy image already in ECR carries
+it.
 
 ## Why a fork at all
 
@@ -210,7 +218,7 @@ bind failure by adding the capability back — move the port.
 
 **Who builds it.** dime-terminal's `infra/jenkins/Jenkinsfile.terminal-openclaw`,
 the same job that rolls the customer fleet: it resolves this repository's
-`dime` branch to a sha, builds `terminal/iron-proxy:dime-<sha12>` into ECR if
+`main` branch to a sha, builds `terminal/iron-proxy:dime-<sha12>` into ECR if
 that tag is not already there, and deploys it in the same run. There is
 deliberately no published image for this fork and no second pipeline —
 a public iron-proxy image would be one without `kms_sm` or caller auth, which
