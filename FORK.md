@@ -186,12 +186,118 @@ one is the point: "this request went upstream with nothing of ours in it"
 previously existed only as the *absence* of three other fields, which is
 neither greppable nor alertable.
 
+**`signed_into`** — the sign-mode counterpart of `swapped`, added with delta 5
+below. Same shape plus a `digest` field: a 12-hex-character prefix of SHA-256
+over the bytes that were signed, which is enough to tie a signature in a
+venue's logs to a request in ours and not enough to reconstruct what it
+covered. A signed request's `outcome` is `swapped` — as far as an audit is
+concerned, something of ours went into it.
+
 The `require`-mode rejection with no placeholder present also gained
 `reject_reason: placeholder_absent`. That refusal is what stops a workload
 bypassing the swap with a credential of its own, so it deserves a name rather
 than a bare `rejected`.
 
-### 5. `Dockerfile` — a build from source
+### 5. `sign` delivery mode — `internal/transform/secrets/sign.go`
+
+A third thing a credential can be. Upstream has two: `inject` (the proxy
+attaches the value, and the agent sends nothing) and `replace` (the agent
+writes a placeholder, the proxy swaps it). Both assume the stored secret is
+the thing that goes on the wire.
+
+A signing key is not. The credential is a private key; what goes on the wire is
+a signature over something the request itself determines — an auth challenge,
+an order payload, a canonical string built from method, path, body and a
+timestamp. Handing the agent the key would defeat the whole arrangement, and
+there is nothing static to substitute.
+
+**The calling convention.** The agent hands over the bytes; the proxy signs
+them.
+
+```
+POST /v1/auth HTTP/1.1
+Host: api.paradex.trade
+X-Dime-Sign-paradex: <base64 of the bytes to sign>
+PARADEX-STARKNET-SIGNATURE: sign-paradex-<22 chars>
+```
+
+The proxy reads the payload header, signs its contents under the credential's
+configured scheme, renders the signature in the configured encoding, and
+substitutes it wherever the placeholder appears — the same scan `replace` uses,
+across headers, query, path and body, which is why the two config blocks share
+field names. The payload header is **removed before forwarding, whatever
+happens next**, including on a refusal: the destination has no business seeing
+what we were asked to sign.
+
+```yaml
+secrets:
+  - source:
+      type: kms_sm
+      secret_id: terminal/prod/<account-id>/paradex-1fbd3c58
+      label: paradex
+    sign:
+      proxy_value: sign-paradex-<22 chars>
+      scheme: ecdsa-p256
+      encoding: hex
+      match_headers: [PARADEX-STARKNET-SIGNATURE]
+      require: true
+```
+
+**The scheme comes from the config, not from the key.** The sealed secret holds
+key material and nothing else; what to do with it — which curve, which encoding
+— is a column on the credential row in dime-terminal's database. So changing a
+scheme is a control-plane edit rather than a re-enrollment, and a stored blob
+carries no instruction about how it is to be used.
+
+**Why the agent supplies the payload.** The alternative considered and rejected
+was for the proxy to derive the signed bytes from the request, through a
+declarative field-mapping. That works, and it is what a venue-specific
+integration looks like — which is the objection: it is a per-endpoint recipe we
+write and maintain for every venue and every signed route it has, and when a
+signature comes out wrong there is no way to tell which mapping rule produced
+it. Agent-supplied bytes are one mechanism that serves every venue, and the
+bytes that produced a bad signature are right there in the request.
+
+**The residual risk, and what bounds it.** A signature over bytes the caller
+chose is portable: the agent decides what gets signed, so it can obtain a
+signature over anything, including something it means to use elsewhere. That is
+accepted for now, and bounded rather than removed:
+
+- the payload header never reaches the destination;
+- a payload is capped at 64 KiB, and one request may produce at most 8
+  signatures;
+- the audit records a 12-hex-character digest of what was signed, never the
+  payload.
+
+The exposure that remains — a venue echoing the request back, putting the
+signature in a response body — is the one `replace` already has, and is
+answered by response scrubbing, which is not yet built.
+
+**Schemes.** `hmac-sha256` covers the whole message; `ecdsa-p256` covers a
+32-byte SHA-256 digest. **A mismatch is refused, not papered over**: a message
+handed to an asymmetric scheme, or a digest handed to a MAC, yields a signature
+the venue rejects with nothing saying why, and that is an afternoon rather than
+a five-minute fix. `stark` is declared and deliberately unimplemented — it
+needs the curve's own scalar arithmetic, and an implementation that is merely
+close either produces signatures nothing accepts or leaks the key through a
+bias nothing here would notice. It arrives as its own change, with vectors.
+
+**The refusal is the documentation.** An agent cannot read this file, the
+config, or the credential's settings page, and sign mode asks more of it than
+either other mode does: a placeholder *and* a separate header carrying bytes in
+a form the scheme dictates. So a refusal states the whole calling convention —
+the payload header by name, what the scheme expects, the placeholder verbatim,
+the encoding the signature comes back in, and the positions scanned.
+The `X-Dime-Credential-Error` reasons are
+`sign_payload_absent`, `sign_payload_malformed`, `sign_payload_too_large`,
+`sign_failed` and `sign_limit`, kept distinct so that a caller — prose or
+tooling — can tell "you sent no bytes" from "re-encode them" from "send fewer"
+from "you sent the wrong shape of bytes" from "this one is not yours to fix".
+The rule every other refusal here follows holds: nothing in a body may help
+obtain the key, and there are tests asserting no line of a PEM reaches either a
+refusal body or the request annotations.
+
+### 6. `Dockerfile` — a build from source
 
 Upstream's `Dockerfile.release` is goreleaser's: it copies a binary
 goreleaser has already cross-compiled into `linux/${TARGETARCH}/`, and the
