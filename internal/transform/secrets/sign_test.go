@@ -18,6 +18,7 @@ import (
 
 	"github.com/ironsh/iron-proxy/internal/hostmatch"
 	"github.com/ironsh/iron-proxy/internal/transform"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -771,4 +772,174 @@ func TestSign_RequireIsNotOptional(t *testing.T) {
 	annotations := runSign(t, s, req)
 	require.Equal(t, outcomePassthrough, annotations["outcome"])
 	require.Empty(t, req.Header.Get(signPayloadHeader("paradex")))
+}
+
+// ---------------------------------------------------------------------------
+// Substituting into a JSON body
+// ---------------------------------------------------------------------------
+
+// TestSwapInBody covers the rule directly, because the end-to-end tests below
+// can only reach a few of its cases.
+func TestSwapInBody(t *testing.T) {
+	const ph = "sign-paradex-Ab3kQ9zLmNpQ"
+	const feltPair = `["123","456"]`
+
+	for name, tc := range map[string]struct{ body, value, want string }{
+		// The case this whole function exists for.
+		"felt pair in a quoted JSON field": {
+			`{"signature":"` + ph + `","market":"BTC-USD-PERP"}`,
+			feltPair,
+			`{"signature":"[\"123\",\"456\"]","market":"BTC-USD-PERP"}`,
+		},
+		// Every value in the fleet today, and both other encodings: nothing to
+		// escape, so the output must be what bytes.ReplaceAll produced before.
+		"hex is untouched": {
+			`{"signature":"` + ph + `"}`,
+			"00ff1001",
+			`{"signature":"00ff1001"}`,
+		},
+		"base64 is untouched": {
+			`{"sig":"` + ph + `"}`,
+			"AP8QAQ==",
+			`{"sig":"AP8QAQ=="}`,
+		},
+		// Not a string literal: no quotes around it, so no escaping.
+		"unquoted in JSON stays raw": {
+			`{"sig":` + ph + `}`,
+			feltPair,
+			`{"sig":["123","456"]}`,
+		},
+		// A quoted placeholder in a body that is not JSON. Escaping here would
+		// corrupt a request that works today.
+		"quoted in a non-JSON body stays raw": {
+			`token="` + ph + `"`,
+			feltPair,
+			`token="["123","456"]"`,
+		},
+		// Only one side quoted is not a string literal either.
+		"half-quoted stays raw": {
+			`{"sig":"` + ph + `}`,
+			feltPair,
+			`{"sig":"["123","456"]}`,
+		},
+		// Several occurrences in one body, each judged on its own
+		// surroundings rather than on a decision made once for the body.
+		"two quoted occurrences": {
+			`{"a":"` + ph + `","b":"` + ph + `"}`,
+			feltPair,
+			`{"a":"[\"123\",\"456\"]","b":"[\"123\",\"456\"]"}`,
+		},
+		"quoted and unquoted in one body": {
+			`{"a":"` + ph + `","b":` + ph + `}`,
+			feltPair,
+			`{"a":"[\"123\",\"456\"]","b":["123","456"]}`,
+		},
+		// A replace-mode secret with a quote in it had the same bug.
+		"a secret containing a quote": {
+			`{"password":"` + ph + `"}`,
+			`p"a\ss`,
+			`{"password":"p\"a\\ss"}`,
+		},
+		"absent placeholder is a no-op": {
+			`{"signature":"something-else"}`,
+			feltPair,
+			`{"signature":"something-else"}`,
+		},
+		// Leading whitespace must not hide the opening brace.
+		"indented JSON is still JSON": {
+			"\n  {\"sig\":\"" + ph + "\"}",
+			feltPair,
+			"\n  {\"sig\":\"[\\\"123\\\",\\\"456\\\"]\"}",
+		},
+		// A top-level array body, which the batch endpoint uses.
+		"JSON array body": {
+			`[{"sig":"` + ph + `"}]`,
+			feltPair,
+			`[{"sig":"[\"123\",\"456\"]"}]`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := string(swapInBody([]byte(tc.body), ph, tc.value))
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestSwapInBody_ProducesParseableJSON is the assertion that actually matters:
+// not what the bytes look like, but that a venue can read them.
+func TestSwapInBody_ProducesParseableJSON(t *testing.T) {
+	const ph = "sign-paradex-Ab3kQ9zLmNpQ"
+	body := `{"market":"BTC-USD-PERP","signature":"` + ph + `","signature_timestamp":1757000000}`
+
+	got := swapInBody([]byte(body), ph, `["123","456"]`)
+
+	var order struct {
+		Market    string `json:"market"`
+		Signature string `json:"signature"`
+		Timestamp int64  `json:"signature_timestamp"`
+	}
+	require.NoError(t, json.Unmarshal(got, &order),
+		"the venue parses this body; unescaped quotes make it unparseable")
+	assert.Equal(t, "BTC-USD-PERP", order.Market)
+	assert.Equal(t, `["123","456"]`, order.Signature,
+		"and the field must decode back to exactly the felt pair the venue expects")
+	assert.Equal(t, int64(1757000000), order.Timestamp, "the rest of the body is untouched")
+}
+
+// TestSign_ParadexShape is the case that prompted all of this: ONE credential,
+// one key, two message types — an auth signature in a header and an order
+// signature inside a JSON body. The two need different renderings of the same
+// encoding, and the position decides which.
+func TestSign_ParadexShape(t *testing.T) {
+	key := base64.StdEncoding.EncodeToString([]byte("stand-in for the stark key"))
+	s := makeSignSecrets(t,
+		map[string]string{"PARADEX_KEY": key},
+		// One entry, scanning headers AND the body, as a Paradex credential
+		// has to be configured.
+		[]secretEntry{signEntry(t, "PARADEX_KEY", "paradex", schemeHMACSHA256, func(c *signConfig) {
+			c.Encoding = encodingFeltPair
+			c.MatchBody = true
+		})})
+
+	sigFor := func(payload []byte) string {
+		mac := hmac.New(sha256.New, []byte("stand-in for the stark key"))
+		mac.Write(payload)
+		out, err := encodeSignature(encodingFeltPair, mac.Sum(nil))
+		require.NoError(t, err)
+		return out
+	}
+
+	t.Run("auth: signature in a header, unescaped", func(t *testing.T) {
+		authPayload := []byte("auth typed data hash")
+		req := paradexReq(t, authPayload, "paradex")
+		req.URL.Path = "/v1/auth"
+		req.Header.Set("PARADEX-STARKNET-SIGNATURE", "sign-paradex-Ab3kQ9zLmNpQ")
+
+		runSign(t, s, req)
+
+		require.Equal(t, sigFor(authPayload), req.Header.Get("PARADEX-STARKNET-SIGNATURE"),
+			"a header value is not JSON, so the felt pair goes in as-is")
+	})
+
+	t.Run("order: signature in a JSON body, escaped", func(t *testing.T) {
+		orderPayload := []byte("order typed data hash")
+		req := paradexReq(t, orderPayload, "paradex")
+		req.URL.Path = "/v1/orders"
+		req.Header.Set("Content-Type", "application/json")
+		req.Body = transform.NewBufferedBodyFromBytes([]byte(
+			`{"market":"BTC-USD-PERP","side":"BUY","size":"0.1",` +
+				`"signature":"sign-paradex-Ab3kQ9zLmNpQ","signature_timestamp":1757000000}`))
+
+		runSign(t, s, req)
+
+		sent, err := io.ReadAll(req.Body)
+		require.NoError(t, err)
+
+		var order map[string]any
+		require.NoError(t, json.Unmarshal(sent, &order),
+			"the order body must still be JSON after the swap")
+		require.Equal(t, sigFor(orderPayload), order["signature"],
+			"and the signature field must decode back to the felt pair")
+		require.Equal(t, "BTC-USD-PERP", order["market"])
+	})
 }

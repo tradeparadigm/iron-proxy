@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -891,7 +892,99 @@ func (s *Secrets) swapBody(req *http.Request, sec *resolvedSecret, realValue str
 		return ""
 	}
 
-	replaced := bytes.ReplaceAll(data, []byte(sec.proxyValue), []byte(realValue))
+	replaced := swapInBody(data, sec.proxyValue, realValue)
 	req.Body = transform.NewBufferedBodyFromBytes(replaced)
 	return "body"
+}
+
+// swapInBody replaces every occurrence of placeholder in data, escaping the
+// substituted value where it lands inside a JSON string.
+//
+// WHY THIS IS NOT bytes.ReplaceAll. A JSON body carries the placeholder inside
+// a quoted string — {"signature":"sign-paradex-…"} — and a substituted value
+// containing a quote or a backslash ends the string early and leaves the venue
+// with a parse error rather than a request. A signature encoded as a felt pair
+// is exactly that value: ["<r>","<s>"], which is what a Cairo venue wants and
+// what its own client sends ESCAPED, as "[\"<r>\",\"<s>\"]".
+//
+// The rule is deliberately narrow: escape only when the body looks like JSON
+// AND the occurrence is delimited by a double quote on both sides, meaning the
+// placeholder is the entire content of a string literal. That is the shape a
+// placeholder actually takes in a JSON body, it needs no parser, and for a
+// value with nothing to escape — every hex and base64 signature, and every API
+// key in the fleet today — the output is byte-identical to the old behaviour.
+//
+// Not attempted: understanding the body. A placeholder spliced into the middle
+// of a string, or a body that is JSON-ish but not JSON, gets the raw value.
+// Guessing further would mean parsing every body of every content type, and
+// being wrong there corrupts requests that work today.
+func swapInBody(data []byte, placeholder, value string) []byte {
+	ph := []byte(placeholder)
+	if len(ph) == 0 {
+		return data
+	}
+	raw := []byte(value)
+	escaped := []byte(jsonStringEscape(value))
+	jsonish := looksLikeJSON(data)
+
+	// The scan keeps data whole and carries an absolute position, rather than
+	// reslicing a shrinking remainder. The test is on the byte BEFORE an
+	// occurrence, and a loop that reslices its input loses the ability to
+	// address that byte for every match after the first.
+	out := make([]byte, 0, len(data))
+	pos := 0
+	for {
+		i := bytes.Index(data[pos:], ph)
+		if i < 0 {
+			return append(out, data[pos:]...)
+		}
+		start, end := pos+i, pos+i+len(ph)
+		out = append(out, data[pos:start]...)
+		if jsonish && start > 0 && data[start-1] == '"' && end < len(data) && data[end] == '"' {
+			out = append(out, escaped...)
+		} else {
+			out = append(out, raw...)
+		}
+		pos = end
+	}
+}
+
+// looksLikeJSON reports whether data opens as a JSON object or array.
+//
+// A cheap gate rather than a parse. It exists to keep the escaping away from
+// bodies that are not JSON at all — a form-encoded or templated body can
+// contain a quoted placeholder too, and escaping there would corrupt a request
+// that works today. A body that opens with { or [ and is not JSON is not
+// something this transform can serve correctly either way.
+func looksLikeJSON(data []byte) bool {
+	t := bytes.TrimLeft(data, " \t\r\n")
+	return len(t) > 0 && (t[0] == '{' || t[0] == '[')
+}
+
+// jsonStringEscape renders v as it must appear INSIDE a JSON string literal —
+// the encoding of the value, without the surrounding quotes, which the body
+// already has.
+//
+// encoding/json rather than hand-rolled: the cases that matter beyond the
+// quote and the backslash are control characters and invalid UTF-8, and those
+// are where a hand-rolled escaper is wrong in a way nothing notices until a
+// venue rejects a request.
+func jsonStringEscape(v string) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	// The default escapes <, > and & as \u003c and friends. Valid, and every
+	// parser decodes it back the same — but it turns a readable signature into
+	// something nobody can match against a packet capture, and this value is
+	// read by whoever is debugging the venue's rejection.
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		// Unreachable for a string, and falling back to the raw value keeps
+		// the old behaviour rather than dropping the substitution.
+		return v
+	}
+	out := bytes.TrimRight(buf.Bytes(), "\n")
+	if len(out) < 2 {
+		return v
+	}
+	return string(out[1 : len(out)-1])
 }

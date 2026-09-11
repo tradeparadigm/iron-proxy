@@ -273,6 +273,19 @@ The exposure that remains — a venue echoing the request back, putting the
 signature in a response body — is the one `replace` already has, and is
 answered by response scrubbing, which is not yet built.
 
+**Where the signature lands decides how it is rendered.** One credential
+routinely serves several message types — on Paradex the same key signs the auth
+challenge, whose signature rides in the `PARADEX-STARKNET-SIGNATURE` header,
+and every order, whose signature is a field in a JSON body. The header takes
+the felt pair as-is; the body needs it escaped, `"[\"<r>\",\"<s>\"]"`, which
+is what the venue's own client sends. So `swapBody` escapes a substituted value
+when the body opens as JSON and the placeholder is the whole content of a
+string literal, and leaves it alone otherwise. The rule needs no parser, and
+for a value with nothing to escape — every hex and base64 signature, and every
+API key in the fleet — the bytes are identical to the `bytes.ReplaceAll` it
+replaced. It fixes the same latent bug in `replace` mode, where a stored secret
+containing a quote produced a body the venue could not parse.
+
 **Schemes.** `hmac-sha256` covers the whole message; `ecdsa-p256` covers a
 32-byte SHA-256 digest. **A mismatch is refused, not papered over**: a message
 handed to an asymmetric scheme, or a digest handed to a MAC, yields a signature
