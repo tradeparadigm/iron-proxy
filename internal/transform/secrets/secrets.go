@@ -656,10 +656,17 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 			tctx.Annotate("label", label)
 			tctx.Annotate("reject_reason", "placeholder_absent")
 			tctx.Annotate("outcome", outcomeRejected)
+			// Same fault, so the same reason code — a tool branching on it is
+			// asking "was the placeholder there", and the answer is no either
+			// way. Only the explanation differs, because the two modes put
+			// different things where the placeholder was.
+			body := placeholderAbsentBody(rejectionHost(req), label, &sec)
+			if sec.mode == "sign" {
+				body = signPlaceholderAbsentBody(rejectionHost(req), label, &sec)
+			}
 			return &transform.TransformResult{
-				Action: transform.ActionReject,
-				Response: rejection(req, "placeholder_absent", label,
-					placeholderAbsentBody(rejectionHost(req), label, &sec)),
+				Action:   transform.ActionReject,
+				Response: rejection(req, "placeholder_absent", label, body),
 			}, nil
 		}
 	}

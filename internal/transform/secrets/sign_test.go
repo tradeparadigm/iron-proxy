@@ -584,6 +584,39 @@ func TestSign_PayloadIsStrippedEvenOnRefusal(t *testing.T) {
 	saysNothingAbout(t, body, base64.StdEncoding.EncodeToString(digest[:]))
 }
 
+// TestSign_PlaceholderRefusalIsAboutSigning, not about substituting a
+// credential. This is the SECOND refusal in the flow — the agent has already
+// fixed the payload — and the replace-mode body it used to fall through to
+// described the wrong mechanism entirely.
+func TestSign_PlaceholderRefusalIsAboutSigning(t *testing.T) {
+	k := newP256Key(t)
+	s := makeSignSecrets(t,
+		map[string]string{"PARADEX_KEY": k.pem},
+		[]secretEntry{signEntry(t, "PARADEX_KEY", "paradex", schemeECDSAP256,
+			func(c *signConfig) { c.MatchBody = true })})
+
+	// Payload correct, no placeholder anywhere.
+	digest := sha256.Sum256([]byte("the auth message hash"))
+	body, header := readRejection(t, s, paradexReq(t, digest[:], "paradex"))
+
+	require.Equal(t, "placeholder_absent", header.Get(rejectionReasonHeader),
+		"the fault is the same one replace mode has, so the reason code is too")
+
+	// What it must now say.
+	says(t, body, "The bytes to sign WERE received and are fine",
+		"an agent that cannot tell step 1 worked will go back and change it")
+	says(t, body, "sign-paradex-Ab3kQ9zLmNpQ", "the placeholder is still the retry")
+	says(t, body, "keep the sign header you already sent")
+	says(t, body, "replaces it with the signature, rendered as a hex string")
+	says(t, body, "Do NOT sign with a key of your own")
+
+	// And what it must no longer say — the replace-mode story.
+	saysNothingAbout(t, body, "substitutes the real credential on the way out",
+		"nothing substitutes a credential here; a signature goes in")
+	saysNothingAbout(t, body, "Do NOT substitute a credential of your own")
+	saysNothingAbout(t, body, "where the credential belongs")
+}
+
 // TestSign_RefusalNeverCarriesTheKey. The same assertion the other refusals
 // carry, and more load-bearing here: the secret is a private key, and this
 // body is handed to the party it is being kept from.

@@ -317,6 +317,42 @@ func signPayloadAbsentBody(host, why string, sec *resolvedSecret) string {
 	return paragraphs(parts...)
 }
 
+// signPlaceholderAbsentBody explains a refusal caused by a sign-mode request
+// that handed over the bytes to sign but never said where the signature goes.
+//
+// Separate from placeholderAbsentBody because that one describes replace mode:
+// it tells the caller the proxy will substitute "the real credential", which
+// for a signing key is not what happens and not what the caller should be
+// looking for. The agent is half-right at this point — step 1 worked — and the
+// body says so, because "was my payload accepted?" is otherwise unanswerable
+// and an agent that cannot tell will go back and change the part that was fine.
+func signPlaceholderAbsentBody(host, label string, sec *resolvedSecret) string {
+	parts := []string{
+		"403 Forbidden — refused by the DIME credential proxy.",
+		fmt.Sprintf("This request was NOT sent to %s. The bytes to sign WERE received and are "+
+			"fine — %s is a signing key, and the proxy is ready to sign with it. What is missing "+
+			"is where to put the result: the request contains no placeholder marking the spot, so "+
+			"there is nowhere for the signature to go.", host, named(label)),
+	}
+	if sec.proxyValue != "" {
+		parts = append(parts,
+			"Put this exact string where the signature belongs, keep the sign header you already "+
+				"sent, and retry:",
+			"    "+sec.proxyValue,
+			fmt.Sprintf("The proxy replaces it with the signature, rendered as %s.",
+				encodingDescription(sec.encoding)))
+	}
+	parts = append(parts,
+		"Where the proxy looks for that string:",
+		bulletList(placeholderLocations(sec)))
+	parts = append(parts,
+		"Nothing else about this request needs to change. The private key is never available to "+
+			"this agent and is not needed. Do NOT sign with a key of your own, and do NOT put a "+
+			"value of your own where the signature belongs — only the placeholder above is "+
+			"substituted.")
+	return paragraphs(parts...)
+}
+
 // signLimitBody explains a refusal caused by one request asking for more
 // signatures than a request is allowed to produce.
 //
