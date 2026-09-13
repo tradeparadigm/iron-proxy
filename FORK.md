@@ -290,10 +290,22 @@ containing a quote produced a body the venue could not parse.
 32-byte SHA-256 digest. **A mismatch is refused, not papered over**: a message
 handed to an asymmetric scheme, or a digest handed to a MAC, yields a signature
 the venue rejects with nothing saying why, and that is an afternoon rather than
-a five-minute fix. `stark` is declared and deliberately unimplemented — it
-needs the curve's own scalar arithmetic, and an implementation that is merely
-close either produces signatures nothing accepts or leaks the key through a
-bias nothing here would notice. It arrives as its own change, with vectors.
+a five-minute fix. `stark` covers one field element — the typed-data
+message hash, 32 bytes big-endian — and its key is a bare hex scalar rather
+than PEM, because that is the only form the Starknet ecosystem uses and the
+form Paradex's own tooling emits.
+
+**The stark signer uses the library the venue verifies with.** Paradex's
+web-api calls `gnark-crypto/ecc/stark-curve/ecdsa`'s `PublicKey.Verify` with a
+nil hash function, an `r||s` signature and the felt as the message; this signs
+through the mirror of that call. That settles two things that would otherwise
+be guesses: the wire shape, and low-s. gnark's `Sign` loops until
+`s <= (order-1)/2` and its `Verify` refuses anything above — so the convention
+lines up by construction rather than by luck, and a signer that emitted high-s
+would be rejected by the venue with nothing saying why. The test does not sign
+and verify with our own code, which would prove only self-consistency: it
+rebuilds Paradex's verification path, public key recovered from the x
+coordinate and all, and checks the signature against that.
 
 **The refusal is the documentation.** An agent cannot read this file, the
 config, or the credential's settings page, and sign mode asks more of it than

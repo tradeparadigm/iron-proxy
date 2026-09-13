@@ -14,6 +14,10 @@ import (
 	"math/big"
 	"net/http"
 	"strings"
+
+	starkcurve "github.com/consensys/gnark-crypto/ecc/stark-curve"
+	starkecdsa "github.com/consensys/gnark-crypto/ecc/stark-curve/ecdsa"
+	"github.com/consensys/gnark-crypto/ecc/stark-curve/fr"
 )
 
 // The signing schemes this build can dispatch on. The control plane checks the
@@ -101,17 +105,86 @@ func signPayload(scheme, key string, payload []byte) ([]byte, error) {
 		return mac.Sum(nil), nil
 
 	case schemeStark:
-		// Deliberately not implemented yet rather than approximated. A STARK
-		// signature needs the curve's own scalar arithmetic, and an
-		// implementation that is merely close produces signatures a venue
-		// rejects — or, worse, leaks the key through a timing or bias flaw
-		// nothing here would notice. It arrives as its own change, with test
-		// vectors, once a reviewed implementation is chosen.
-		return nil, errors.New("the stark scheme is not implemented in this build")
+		// THE SAME LIBRARY THE VENUE VERIFIES WITH. Paradex's own web-api calls
+		// gnark-crypto's stark-curve ecdsa.PublicKey.Verify with a nil hash
+		// function, an r||s signature and the felt as the message — so signing
+		// here is the exact mirror of that call, not an independent reading of
+		// a spec. gnark's Sign also loops until s <= (order-1)/2, and that
+		// same Verify rejects a high-s signature, so the low-s convention
+		// lines up on both sides rather than by luck.
+		if len(payload) != feltBytes {
+			return nil, fmt.Errorf("%s signs one field element of exactly %d bytes, got %d: send the "+
+				"typed-data message hash as big-endian bytes, not the typed data itself",
+				schemeStark, feltBytes, len(payload))
+		}
+		priv, err := parseStarkPrivateKey(key)
+		if err != nil {
+			return nil, err
+		}
+		sig, err := priv.Sign(payload, nil)
+		if err != nil {
+			return nil, errors.New("stark sign failed")
+		}
+		// gnark returns r||s, each padded to the scalar size, which is what
+		// encodeFeltPair splits. Any other length means the library changed
+		// shape under us and the felt pair below would silently mis-split.
+		if len(sig) != 2*feltBytes {
+			return nil, fmt.Errorf("stark signature is %d bytes, expected %d", len(sig), 2*feltBytes)
+		}
+		return sig, nil
 
 	default:
 		return nil, fmt.Errorf("unknown signing scheme %q", scheme)
 	}
+}
+
+// feltBytes is the width of a STARK field element on the wire. The curve's
+// order is just under 2^252, so a felt always fits in 32 bytes and is always
+// written padded to 32 — which is what the venue hashes and what it verifies
+// against.
+const feltBytes = 32
+
+// parseStarkPrivateKey builds a signing key from a bare scalar.
+//
+// NOT PEM, unlike the other asymmetric scheme here. A Starknet key has no
+// standard container: every tool in that ecosystem passes the scalar as hex,
+// and Paradex's own code formats it as "0x%064x". Demanding PEM would mean
+// asking a customer to wrap a value nothing else wraps.
+//
+// gnark's PrivateKey.SetBytes wants [compressed public key || scalar], so the
+// public half is derived here rather than asked for. That also means a
+// malformed scalar is caught at this boundary instead of producing a key that
+// signs successfully and verifies nowhere.
+func parseStarkPrivateKey(key string) (*starkecdsa.PrivateKey, error) {
+	raw := strings.TrimSpace(key)
+	raw = strings.TrimPrefix(strings.TrimPrefix(raw, "0x"), "0X")
+	if raw == "" {
+		return nil, errors.New("stark signing key is empty")
+	}
+	d, ok := new(big.Int).SetString(raw, 16)
+	if !ok {
+		return nil, errors.New("stark signing key is not a hex scalar")
+	}
+	if d.Sign() <= 0 || d.Cmp(fr.Modulus()) >= 0 {
+		// Zero, negative or beyond the curve order. All three produce a key
+		// that is not a key; the last is the one a truncated or doubled paste
+		// actually produces.
+		return nil, errors.New("stark signing key is out of range for the curve")
+	}
+
+	var pub starkcurve.G1Affine
+	pub.ScalarMultiplicationBase(d)
+	compressed := pub.Bytes()
+
+	buf := make([]byte, len(compressed)+feltBytes)
+	copy(buf, compressed[:])
+	d.FillBytes(buf[len(compressed):])
+
+	var priv starkecdsa.PrivateKey
+	if _, err := priv.SetBytes(buf); err != nil {
+		return nil, errors.New("could not build the stark signing key")
+	}
+	return &priv, nil
 }
 
 // encodeSignature renders a signature for the wire.
@@ -280,8 +353,10 @@ func schemeExpectation(scheme string) string {
 			"Send the exact canonical bytes the venue will verify — do not hash them first.",
 			schemeHMACSHA256)
 	case schemeStark:
-		return fmt.Sprintf("This credential signs with %s, which covers a single field element: the "+
-			"Poseidon hash of the venue's typed data, as big-endian bytes.", schemeStark)
+		return fmt.Sprintf("This credential signs with %s, which covers ONE FIELD ELEMENT of exactly "+
+			"%d bytes: the typed-data message hash, big-endian. Compute the venue's message hash "+
+			"over its typed data and send that — not the typed data, and not a SHA-256 of it. The "+
+			"signature comes back as the (r,s) pair.", schemeStark, feltBytes)
 	default:
 		return fmt.Sprintf("This credential signs with %q.", scheme)
 	}

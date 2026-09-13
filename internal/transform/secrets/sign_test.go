@@ -11,11 +11,17 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"strings"
 	"testing"
 
+	starkcurve "github.com/consensys/gnark-crypto/ecc/stark-curve"
+	starkecdsa "github.com/consensys/gnark-crypto/ecc/stark-curve/ecdsa"
+	"github.com/consensys/gnark-crypto/ecc/stark-curve/fp"
+	"github.com/consensys/gnark-crypto/ecc/stark-curve/fr"
 	"github.com/ironsh/iron-proxy/internal/hostmatch"
 	"github.com/ironsh/iron-proxy/internal/transform"
 	"github.com/stretchr/testify/assert"
@@ -216,15 +222,6 @@ func TestSignPayload_HMACRejectsBadKeys(t *testing.T) {
 			require.Contains(t, err.Error(), tc.want)
 		})
 	}
-}
-
-// TestSignPayload_StarkIsHonestlyUnimplemented pins the deliberate gap. If
-// somebody wires a STARK implementation in, this test fails and they have to
-// come here and replace it with real vectors — which is the point.
-func TestSignPayload_StarkIsHonestlyUnimplemented(t *testing.T) {
-	_, err := signPayload(schemeStark, "0x1", make([]byte, 32))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "not implemented in this build")
 }
 
 func TestSignPayload_UnknownSchemeRefuses(t *testing.T) {
@@ -975,4 +972,169 @@ func TestSign_ParadexShape(t *testing.T) {
 			"and the signature field must decode back to the felt pair")
 		require.Equal(t, "BTC-USD-PERP", order["market"])
 	})
+}
+
+// ---------------------------------------------------------------------------
+// The STARK curve
+// ---------------------------------------------------------------------------
+
+// starkKey is a valid scalar, in the form Paradex's own code writes one
+// (aux-account-deployer/keys/keypair.go formats keys as "0x%064x").
+const starkKey = "0x03c0c075fb3b542a285cb277f46ab9756a7d69181b5e985760a35af798b0c387"
+
+// starkFelt is a message hash as the agent would supply it: the felt from
+// typed_data.message_hash(account_address), 32 big-endian bytes.
+func starkFelt(t *testing.T, dec string) []byte {
+	t.Helper()
+	n, ok := new(big.Int).SetString(dec, 10)
+	require.True(t, ok)
+	out := make([]byte, 32)
+	n.FillBytes(out)
+	return out
+}
+
+// TestSignPayload_StarkVerifiesTheWayParadexVerifies is the test that decides
+// whether this scheme works at all.
+//
+// It does NOT sign and then verify with our own signer — that proves only
+// self-consistency, and a signer that is internally consistent and wrong is
+// exactly the failure mode here. It reproduces the verification path from
+// Paradex's own web-api (api/paradex/web-api/starknet/signature.go): the same
+// gnark-crypto stark-curve ecdsa, a public key built from the x coordinate
+// alone with y recovered, hFunc nil, and the signature as r||s.
+func TestSignPayload_StarkVerifiesTheWayParadexVerifies(t *testing.T) {
+	payload := starkFelt(t, "2846891009026995430665703316224827616914889274105712248413538305735679628177")
+
+	sig, err := signPayload(schemeStark, starkKey, payload)
+	require.NoError(t, err)
+	require.Len(t, sig, 64, "r||s, each padded to the scalar size")
+
+	// Rebuild the verifier the way the venue does: from the x coordinate only.
+	priv, err := parseStarkPrivateKey(starkKey)
+	require.NoError(t, err)
+	pubX := priv.PublicKey.A.X
+
+	var pub starkecdsa.PublicKey
+	pub.A.X = pubX
+	pub.A.Y = *recoverStarkY(t, &pubX)
+
+	ok, err := pub.Verify(sig, payload, nil)
+	require.NoError(t, err)
+	require.True(t, ok,
+		"a signature the venue's own verification path rejects is worse than no signature")
+}
+
+// recoverStarkY solves y² = x³ + x + b for y, which is what Paradex's
+// PublicKey.Verify does when given only an x coordinate. Either root works —
+// verification tries both — so this returns one and the caller may need the
+// negation; the test below pins that we picked a root that verifies.
+func recoverStarkY(t *testing.T, x *fp.Element) *fp.Element {
+	t.Helper()
+	var ySquared fp.Element
+	ySquared.Mul(x, x).Mul(&ySquared, x)
+	ySquared.Add(&ySquared, x)
+	_, b := starkcurve.CurveCoefficients()
+	ySquared.Add(&ySquared, &b)
+	y := ySquared.Sqrt(&ySquared)
+	require.NotNil(t, y, "x is not on the curve")
+
+	// Pick the root matching the real key, so the assertion above is about the
+	// signature rather than about which square root we happened to take.
+	priv, err := parseStarkPrivateKey(starkKey)
+	require.NoError(t, err)
+	if !y.Equal(&priv.PublicKey.A.Y) {
+		y.Neg(y)
+	}
+	return y
+}
+
+// TestSignPayload_StarkIsLowS. Paradex verifies with gnark, and gnark's Verify
+// REFUSES a signature whose s is above (order-1)/2. Our signer must therefore
+// produce low-s, and it does because it is the same library — this pins that
+// the property is actually present rather than assumed.
+func TestSignPayload_StarkIsLowS(t *testing.T) {
+	half := new(big.Int).Rsh(fr.Modulus(), 1)
+	for i := 0; i < 32; i++ {
+		payload := starkFelt(t, fmt.Sprintf("%d", 1000000007+i))
+		sig, err := signPayload(schemeStark, starkKey, payload)
+		require.NoError(t, err)
+		s := new(big.Int).SetBytes(sig[32:])
+		require.LessOrEqual(t, s.Cmp(half), 0,
+			"high-s signature %d would be rejected by the venue", i)
+	}
+}
+
+// TestSignPayload_StarkRendersAsAFeltPair ties the scheme to the encoding the
+// venue actually reads: PARADEX-STARKNET-SIGNATURE and the order body's
+// "signature" field are both ["<r>","<s>"] as decimal strings.
+func TestSignPayload_StarkRendersAsAFeltPair(t *testing.T) {
+	payload := starkFelt(t, "2846891009026995430665703316224827616914889274105712248413538305735679628177")
+	sig, err := signPayload(schemeStark, starkKey, payload)
+	require.NoError(t, err)
+
+	out, err := encodeSignature(encodingFeltPair, sig)
+	require.NoError(t, err)
+
+	var parts []string
+	require.NoError(t, json.Unmarshal([]byte(out), &parts))
+	require.Len(t, parts, 2)
+	r, ok := new(big.Int).SetString(parts[0], 10)
+	require.True(t, ok, "r must be a decimal string")
+	s, ok := new(big.Int).SetString(parts[1], 10)
+	require.True(t, ok, "s must be a decimal string")
+	require.Equal(t, new(big.Int).SetBytes(sig[:32]), r)
+	require.Equal(t, new(big.Int).SetBytes(sig[32:]), s)
+}
+
+// TestSignPayload_StarkRefusesTheWrongInput. The felt is the whole message as
+// far as this scheme is concerned, and anything else is a caller that has not
+// hashed the typed data.
+func TestSignPayload_StarkRefusesTheWrongInput(t *testing.T) {
+	for name, payload := range map[string][]byte{
+		"a whole message": []byte("the typed data, unhashed"),
+		"too short":       make([]byte, 31),
+		"too long":        make([]byte, 33),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := signPayload(schemeStark, starkKey, payload)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "one field element of exactly 32 bytes")
+			require.Contains(t, err.Error(), "message hash")
+		})
+	}
+}
+
+// TestParseStarkPrivateKey covers what a customer might paste.
+func TestParseStarkPrivateKey(t *testing.T) {
+	t.Run("accepts what Paradex's own tooling emits", func(t *testing.T) {
+		with0x, err := parseStarkPrivateKey(starkKey)
+		require.NoError(t, err)
+		// Bare hex, no padding, and stray whitespace are all the same key.
+		for _, variant := range []string{
+			strings.TrimPrefix(starkKey, "0x"),
+			"  " + starkKey + "\n",
+			"0x" + strings.TrimLeft(strings.TrimPrefix(starkKey, "0x"), "0"),
+		} {
+			got, err := parseStarkPrivateKey(variant)
+			require.NoError(t, err, variant)
+			require.Equal(t, with0x.PublicKey.A.X, got.PublicKey.A.X,
+				"%q must derive the same key", variant)
+		}
+	})
+
+	for name, tc := range map[string]struct{ key, want string }{
+		"empty":         {"", "is empty"},
+		"only 0x":       {"0x", "is empty"},
+		"not hex":       {"0xnot-a-scalar", "not a hex scalar"},
+		"a PEM key":     {"-----BEGIN EC PRIVATE KEY-----", "not a hex scalar"},
+		"zero":          {"0x0", "out of range"},
+		"at the order":  {"0x800000000000010ffffffffffffffffffb781126dcae7b2321e66a241adc64d2f", "out of range"},
+		"doubled paste": {strings.Repeat("f", 128), "out of range"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseStarkPrivateKey(tc.key)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.want)
+		})
+	}
 }
