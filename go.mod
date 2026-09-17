@@ -26,7 +26,7 @@ require (
 	go.opentelemetry.io/otel/log v0.20.0
 	go.opentelemetry.io/otel/sdk v1.44.0
 	go.opentelemetry.io/otel/sdk/log v0.20.0
-	golang.org/x/net v0.55.0
+	golang.org/x/net v0.57.0
 	golang.org/x/oauth2 v0.36.0
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11
@@ -54,8 +54,10 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.36.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.1 // indirect
 	github.com/aws/smithy-go v1.28.1 // indirect
+	github.com/bits-and-blooms/bitset v1.24.6 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/consensys/gnark-crypto v0.21.0 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
@@ -113,12 +115,12 @@ require (
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.10.0 // indirect
 	go.uber.org/atomic v1.9.0 // indirect
-	golang.org/x/crypto v0.51.0 // indirect
-	golang.org/x/mod v0.35.0 // indirect
-	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
-	golang.org/x/tools v0.44.0 // indirect
+	golang.org/x/crypto v0.54.0 // indirect
+	golang.org/x/mod v0.38.0 // indirect
+	golang.org/x/sync v0.22.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/tools v0.48.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 )

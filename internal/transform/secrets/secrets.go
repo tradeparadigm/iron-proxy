@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -36,6 +37,7 @@ type secretEntry struct {
 	Rules   []hostmatch.RuleConfig `yaml:"rules"`
 	Inject  *injectConfig          `yaml:"inject,omitempty"`
 	Replace *replaceConfig         `yaml:"replace,omitempty"`
+	Sign    *signConfig            `yaml:"sign,omitempty"`
 
 	// Deprecated top-level fields for backwards compatibility.
 	// Users should migrate to the replace block.
@@ -47,6 +49,21 @@ type secretEntry struct {
 
 type replaceConfig struct {
 	ProxyValue   string   `yaml:"proxy_value"`
+	MatchHeaders []string `yaml:"match_headers,omitempty"`
+	MatchBody    bool     `yaml:"match_body,omitempty"`
+	MatchPath    bool     `yaml:"match_path,omitempty"`
+	MatchQuery   bool     `yaml:"match_query,omitempty"`
+	Require      bool     `yaml:"require,omitempty"`
+}
+
+// signConfig is replace's shape plus the two things that make it signing: the
+// algorithm to use, and how the signature is written back. The scan fields are
+// replace's and deliberately spelled the same, because finding the placeholder
+// IS the same operation — only the substituted value differs.
+type signConfig struct {
+	ProxyValue   string   `yaml:"proxy_value"`
+	Scheme       string   `yaml:"scheme"`
+	Encoding     string   `yaml:"encoding,omitempty"`
 	MatchHeaders []string `yaml:"match_headers,omitempty"`
 	MatchBody    bool     `yaml:"match_body,omitempty"`
 	MatchPath    bool     `yaml:"match_path,omitempty"`
@@ -66,7 +83,7 @@ type injectConfig struct {
 // resolvedSecret is a secret ready for use after config parsing and source resolution.
 type resolvedSecret struct {
 	source secretSource
-	mode   string // "replace" or "inject"
+	mode   string // "replace", "inject" or "sign"
 	rules  []hostmatch.Rule
 
 	// replace mode fields
@@ -81,6 +98,15 @@ type resolvedSecret struct {
 	injectHeader     string
 	injectQueryParam string
 	formatter        *template.Template // nil = identity (raw value)
+
+	// sign mode fields. The scan fields above are shared with replace; these
+	// two say what to substitute rather than where.
+	scheme   string
+	encoding string
+	// label names the payload header the caller hands the bytes over in. Read
+	// off the source rather than configured, so the two sides cannot disagree
+	// about it.
+	label string
 }
 
 // headerMatcher selects request headers to scan. Exactly one of name or re is set.
@@ -169,6 +195,23 @@ type jsonKeyHint struct {
 	JSONKey string `yaml:"json_key"`
 }
 
+// labelHint peeks at the optional label field, common to every source type.
+//
+// SIGN MODE REQUIRES A LABEL — it is the suffix of the X-Dime-Sign-<label>
+// header the caller sends — and until now only the DIME kms_sm source carried
+// one, because it derives the label from the credential it opens. That made
+// signing impossible to exercise on an `env` or `file` source: the two anyone
+// can use on a laptop or in CI, and this repo runs no CI on pull requests, so
+// the whole path had no way to be driven end to end without a provisioned KMS
+// key and Secrets Manager entry.
+//
+// Naming the label in config fakes only WHERE THE SECRET COMES FROM. Key
+// parsing, the scheme dispatch, the encoding, the substitution and every
+// refusal stay the real code. That is the part worth being able to run.
+type labelHint struct {
+	Label string `yaml:"label"`
+}
+
 // resolveSource dispatches a source config through the registry and applies
 // the optional json_key extraction, which is available to every source type.
 func resolveSource(registry sourceBuilderRegistry, node yaml.Node) (secretSource, error) {
@@ -194,6 +237,22 @@ func resolveSource(registry sourceBuilderRegistry, node yaml.Node) (secretSource
 	if jk.JSONKey != "" {
 		src = &jsonKeySource{inner: src, key: jk.JSONKey}
 	}
+
+	// OUTSIDE the json_key wrapper, because sourceLabel asserts on the
+	// outermost value and jsonKeySource carries no Label of its own.
+	//
+	// Only when the source has not already named itself. kms_sm reads this
+	// same key and requires it — the label is half the envelope's AAD — so the
+	// two cannot disagree; the guard is here so a labelled source is not
+	// wrapped in a second label, which would leave two places to look when an
+	// AAD mismatch has to be explained.
+	var lh labelHint
+	if err := node.Decode(&lh); err != nil {
+		return nil, fmt.Errorf("parsing label: %w", err)
+	}
+	if lh.Label != "" && sourceLabel(src) == "" {
+		src = labeledSource{Source: src, label: lh.Label}
+	}
 	return src, nil
 }
 
@@ -203,7 +262,7 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 
 	for i, entry := range cfg.Secrets {
 		// Normalize legacy top-level fields into a replace block.
-		replace, inject, err := normalizeEntry(i, &entry)
+		replace, inject, sign, err := normalizeEntry(i, &entry)
 		if err != nil {
 			return nil, err
 		}
@@ -235,6 +294,39 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 				sec.formatter = tmpl
 			}
 			resolved = append(resolved, sec)
+		} else if sign != nil {
+			matchers, err := parseHeaderMatchers(sign.MatchHeaders, fmt.Sprintf("secrets[%d]", i))
+			if err != nil {
+				return nil, err
+			}
+			// The payload header is named after the credential, so a sign
+			// entry whose source has no label has no header for the caller to
+			// use and can never produce a signature. validateSign cannot see
+			// this — the label belongs to the source, not the sign block — so
+			// it is checked here, where the source is resolved, and refused at
+			// load for the same reason validateSign refuses an unknown scheme:
+			// a config that loads and then rejects every request to the host
+			// is indistinguishable from an outage.
+			label := sourceLabel(source)
+			if label == "" {
+				return nil, fmt.Errorf("secrets[%d]: sign mode needs a labelled credential source; "+
+					"%q has no label, so there is no %s header for the caller to send",
+					i, source.Name(), signPayloadHeader("<label>"))
+			}
+			resolved = append(resolved, resolvedSecret{
+				source:       source,
+				mode:         "sign",
+				proxyValue:   sign.ProxyValue,
+				scheme:       sign.Scheme,
+				encoding:     sign.Encoding,
+				matchHeaders: matchers,
+				matchBody:    sign.MatchBody,
+				matchPath:    sign.MatchPath,
+				matchQuery:   sign.MatchQuery,
+				require:      sign.Require,
+				rules:        rules,
+				label:        label,
+			})
 		} else {
 			matchers, err := parseHeaderMatchers(replace.MatchHeaders, fmt.Sprintf("secrets[%d]", i))
 			if err != nil {
@@ -259,10 +351,11 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 
 // normalizeEntry validates the entry and returns either a replaceConfig or injectConfig.
 // It handles legacy top-level fields by normalizing them into a replaceConfig.
-func normalizeEntry(i int, entry *secretEntry) (*replaceConfig, *injectConfig, error) {
+func normalizeEntry(i int, entry *secretEntry) (*replaceConfig, *injectConfig, *signConfig, error) {
 	hasLegacy := entry.ProxyValue != "" || len(entry.MatchHeaders) > 0 || entry.MatchBody || entry.Require
 	hasReplace := entry.Replace != nil
 	hasInject := entry.Inject != nil
+	hasSign := entry.Sign != nil
 
 	// Count how many modes are specified.
 	modeCount := 0
@@ -275,44 +368,80 @@ func normalizeEntry(i int, entry *secretEntry) (*replaceConfig, *injectConfig, e
 	if hasInject {
 		modeCount++
 	}
+	if hasSign {
+		modeCount++
+	}
 
 	if modeCount == 0 {
-		return nil, nil, fmt.Errorf("secrets[%d]: must specify either inject or replace", i)
+		return nil, nil, nil, fmt.Errorf("secrets[%d]: must specify inject, replace or sign", i)
 	}
 	if modeCount > 1 {
 		if hasLegacy && hasReplace {
-			return nil, nil, fmt.Errorf("secrets[%d]: cannot use both top-level proxy_value/match_headers and replace block", i)
+			return nil, nil, nil, fmt.Errorf("secrets[%d]: cannot use both top-level proxy_value/match_headers and replace block", i)
 		}
 		if hasLegacy && hasInject {
-			return nil, nil, fmt.Errorf("secrets[%d]: cannot use both top-level proxy_value/match_headers and inject block", i)
+			return nil, nil, nil, fmt.Errorf("secrets[%d]: cannot use both top-level proxy_value/match_headers and inject block", i)
 		}
-		return nil, nil, fmt.Errorf("secrets[%d]: cannot specify both inject and replace", i)
+		return nil, nil, nil, fmt.Errorf("secrets[%d]: cannot specify more than one of inject, replace and sign", i)
 	}
 
 	if hasInject {
 		if err := validateInject(i, entry.Inject); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return nil, entry.Inject, nil
+		return nil, entry.Inject, nil, nil
+	}
+
+	if hasSign {
+		if err := validateSign(i, entry.Sign); err != nil {
+			return nil, nil, nil, err
+		}
+		return nil, nil, entry.Sign, nil
 	}
 
 	if hasReplace {
 		if entry.Replace.ProxyValue == "" {
-			return nil, nil, fmt.Errorf("secrets[%d]: replace.proxy_value is required", i)
+			return nil, nil, nil, fmt.Errorf("secrets[%d]: replace.proxy_value is required", i)
 		}
-		return entry.Replace, nil, nil
+		return entry.Replace, nil, nil, nil
 	}
 
 	// Legacy top-level fields: normalize into replaceConfig.
 	if entry.ProxyValue == "" {
-		return nil, nil, fmt.Errorf("secrets[%d]: proxy_value is required", i)
+		return nil, nil, nil, fmt.Errorf("secrets[%d]: proxy_value is required", i)
 	}
 	return &replaceConfig{
 		ProxyValue:   entry.ProxyValue,
 		MatchHeaders: entry.MatchHeaders,
 		MatchBody:    entry.MatchBody,
 		Require:      entry.Require,
-	}, nil, nil
+	}, nil, nil, nil
+}
+
+// validateSign refuses a sign block that could not produce a signature.
+//
+// The scheme is checked HERE, at config load, rather than at the first matching
+// request. A config that parses and then refuses every request to a
+// credentialed host is indistinguishable from an outage; a config that refuses
+// to load names the entry and the value, and the proxy keeps serving whatever
+// it had before.
+func validateSign(i int, cfg *signConfig) error {
+	if cfg.ProxyValue == "" {
+		return fmt.Errorf("secrets[%d]: sign.proxy_value is required", i)
+	}
+	switch cfg.Scheme {
+	case schemeHMACSHA256, schemeECDSAP256, schemeStark:
+	case "":
+		return fmt.Errorf("secrets[%d]: sign.scheme is required", i)
+	default:
+		return fmt.Errorf("secrets[%d]: unknown sign.scheme %q", i, cfg.Scheme)
+	}
+	switch cfg.Encoding {
+	case encodingHex, encodingBase64, encodingFeltPair, "":
+	default:
+		return fmt.Errorf("secrets[%d]: unknown sign.encoding %q", i, cfg.Encoding)
+	}
+	return nil
 }
 
 func validateInject(i int, cfg *injectConfig) error {
@@ -326,6 +455,15 @@ func validateInject(i int, cfg *injectConfig) error {
 		return fmt.Errorf("secrets[%d]: inject cannot specify both header and query_param", i)
 	}
 	return nil
+}
+
+// sourceLabel reads the optional operator-facing name off a source. Only the
+// DIME sources carry one; an env or file source is nameless.
+func sourceLabel(src Source) string {
+	if l, ok := src.(interface{ Label() string }); ok {
+		return l.Label()
+	}
+	return ""
 }
 
 func (s *Secrets) Name() string { return "secrets" }
@@ -373,15 +511,17 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		// a person needs the name the person chose.
 		Label     string   `json:"label,omitempty"`
 		Locations []string `json:"locations"`
+		// Digest identifies WHAT was signed, for sign mode only: a short
+		// SHA-256 prefix over the payload, never the payload. Enough to tie a
+		// signature in a venue's logs to a request in ours, and not enough to
+		// reconstruct what it covered.
+		Digest string `json:"digest,omitempty"`
 	}
-	// labelOf reads the optional operator-facing name off a source.
-	labelOf := func(src Source) string {
-		if l, ok := src.(interface{ Label() string }); ok {
-			return l.Label()
-		}
-		return ""
-	}
-	var swapped, injected []secretRecord
+	labelOf := sourceLabel
+	var swapped, injected, signed []secretRecord
+	// Bounded per request rather than per entry: many entries can match one
+	// host, and the cap is about what a single request may become.
+	signsLeft := maxSignsPerRequest
 	var unavailable []string
 
 	for _, sec := range s.secrets {
@@ -424,27 +564,116 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 			continue
 		}
 
+		// SIGN MODE substitutes a computed value, and everything after this
+		// point is replace's code unchanged — the scan, the positions, the
+		// require refusal. Only what gets written differs, which is the whole
+		// reason the config shares replace's field names.
+		swapValue := realValue
+		var signDigest string
+		if sec.mode == "sign" {
+			// The budget is checked BEFORE the payload, because it does not
+			// depend on what the caller sent: it is a property of how many
+			// signing credentials are configured for this host. Checking it
+			// second would report a payload fault on a request that was going
+			// to be refused for the config either way, and send the agent
+			// chasing its own request.
+			if signsLeft <= 0 {
+				tctx.Annotate("rejected", name)
+				tctx.Annotate("label", sec.label)
+				tctx.Annotate("reject_reason", "sign_limit")
+				tctx.Annotate("outcome", outcomeRejected)
+				return &transform.TransformResult{
+					Action: transform.ActionReject,
+					Response: rejection(req, "sign_limit", sec.label,
+						signLimitBody(rejectionHost(req))),
+				}, nil
+			}
+			signsLeft--
+
+			payload, reason, why := s.signPayloadFor(req, &sec)
+			if why != "" {
+				tctx.Annotate("rejected", name)
+				tctx.Annotate("label", sec.label)
+				tctx.Annotate("reject_reason", reason)
+				tctx.Annotate("outcome", outcomeRejected)
+				return &transform.TransformResult{
+					Action: transform.ActionReject,
+					Response: rejection(req, reason, sec.label,
+						signPayloadAbsentBody(rejectionHost(req), why, &sec)),
+				}, nil
+			}
+
+			sig, err := signPayload(sec.scheme, realValue, payload)
+			if err != nil {
+				// The signing error names the scheme and the shape it wanted,
+				// and none of it is about the key — so unlike a fetch failure
+				// this one is safe, and useful, to hand back.
+				tctx.Annotate("rejected", name)
+				tctx.Annotate("label", sec.label)
+				tctx.Annotate("reject_reason", "sign_failed")
+				tctx.Annotate("outcome", outcomeRejected)
+				tctx.Annotate("sign_error", err.Error())
+				return &transform.TransformResult{
+					Action: transform.ActionReject,
+					Response: rejection(req, "sign_failed", sec.label,
+						signFailedBody(rejectionHost(req), sec.scheme, err)),
+				}, nil
+			}
+			encoded, err := encodeSignature(sec.encoding, sig)
+			if err != nil {
+				tctx.Annotate("rejected", name)
+				tctx.Annotate("label", sec.label)
+				tctx.Annotate("reject_reason", "sign_failed")
+				tctx.Annotate("outcome", outcomeRejected)
+				tctx.Annotate("sign_error", err.Error())
+				return &transform.TransformResult{
+					Action: transform.ActionReject,
+					Response: rejection(req, "sign_failed", sec.label,
+						signFailedBody(rejectionHost(req), sec.scheme, err)),
+				}, nil
+			}
+			swapValue = encoded
+
+			// STRIPPED WHATEVER HAPPENS NEXT. The venue has no business seeing
+			// what we were asked to sign, and a payload left on the request is
+			// handed to whoever it was going to. Removed here rather than after
+			// a successful swap, so the require refusal below cannot forward it
+			// either.
+			req.Header.Del(signPayloadHeader(sec.label))
+
+			// Recorded on the entry's own record below rather than annotated
+			// here. Several entries can sign in one request, and a per-entry
+			// annotation under a single key would leave only the last.
+			signDigest = payloadDigest(payload)
+		}
+
 		var locations []string
-		locations = append(locations, s.swapHeaders(req, &sec, realValue)...)
+		locations = append(locations, s.swapHeaders(req, &sec, swapValue)...)
 
 		if sec.matchQuery {
-			locations = append(locations, s.swapQuery(req, &sec, realValue)...)
+			locations = append(locations, s.swapQuery(req, &sec, swapValue)...)
 		}
 
 		if sec.matchPath {
-			if loc := s.swapPath(req, &sec, realValue); loc != "" {
+			if loc := s.swapPath(req, &sec, swapValue); loc != "" {
 				locations = append(locations, loc)
 			}
 		}
 
 		if sec.matchBody {
-			if loc := s.swapBody(req, &sec, realValue); loc != "" {
+			if loc := s.swapBody(req, &sec, swapValue); loc != "" {
 				locations = append(locations, loc)
 			}
 		}
 
 		if len(locations) > 0 {
-			swapped = append(swapped, secretRecord{Secret: name, Label: labelOf(sec.source), Locations: locations})
+			rec := secretRecord{Secret: name, Label: labelOf(sec.source), Locations: locations}
+			if sec.mode == "sign" {
+				rec.Digest = signDigest
+				signed = append(signed, rec)
+			} else {
+				swapped = append(swapped, rec)
+			}
 		} else if sec.require {
 			// require + nothing matched: the workload sent a request to a
 			// credentialed host WITHOUT the placeholder. Refusing is the
@@ -460,10 +689,17 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 			tctx.Annotate("label", label)
 			tctx.Annotate("reject_reason", "placeholder_absent")
 			tctx.Annotate("outcome", outcomeRejected)
+			// Same fault, so the same reason code — a tool branching on it is
+			// asking "was the placeholder there", and the answer is no either
+			// way. Only the explanation differs, because the two modes put
+			// different things where the placeholder was.
+			body := placeholderAbsentBody(rejectionHost(req), label, &sec)
+			if sec.mode == "sign" {
+				body = signPlaceholderAbsentBody(rejectionHost(req), label, &sec)
+			}
 			return &transform.TransformResult{
-				Action: transform.ActionReject,
-				Response: rejection(req, "placeholder_absent", label,
-					placeholderAbsentBody(rejectionHost(req), label, &sec)),
+				Action:   transform.ActionReject,
+				Response: rejection(req, "placeholder_absent", label, body),
 			}, nil
 		}
 	}
@@ -474,6 +710,9 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 	if len(injected) > 0 {
 		tctx.Annotate("injected", injected)
 	}
+	if len(signed) > 0 {
+		tctx.Annotate("signed_into", signed)
+	}
 	if len(unavailable) > 0 {
 		tctx.Annotate("secret_unavailable", unavailable)
 	}
@@ -482,7 +721,7 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 	// "a credential left the proxy" versus "it did not", and a state that
 	// exists only as the absence of three other fields is neither greppable
 	// nor alertable. passthrough is the value that was previously unsayable.
-	tctx.Annotate("outcome", requestOutcome(len(injected) > 0, len(swapped) > 0))
+	tctx.Annotate("outcome", requestOutcome(len(injected) > 0, len(swapped) > 0 || len(signed) > 0))
 
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
 }
@@ -693,7 +932,99 @@ func (s *Secrets) swapBody(req *http.Request, sec *resolvedSecret, realValue str
 		return ""
 	}
 
-	replaced := bytes.ReplaceAll(data, []byte(sec.proxyValue), []byte(realValue))
+	replaced := swapInBody(data, sec.proxyValue, realValue)
 	req.Body = transform.NewBufferedBodyFromBytes(replaced)
 	return "body"
+}
+
+// swapInBody replaces every occurrence of placeholder in data, escaping the
+// substituted value where it lands inside a JSON string.
+//
+// WHY THIS IS NOT bytes.ReplaceAll. A JSON body carries the placeholder inside
+// a quoted string — {"signature":"sign-paradex-…"} — and a substituted value
+// containing a quote or a backslash ends the string early and leaves the venue
+// with a parse error rather than a request. A signature encoded as a felt pair
+// is exactly that value: ["<r>","<s>"], which is what a Cairo venue wants and
+// what its own client sends ESCAPED, as "[\"<r>\",\"<s>\"]".
+//
+// The rule is deliberately narrow: escape only when the body looks like JSON
+// AND the occurrence is delimited by a double quote on both sides, meaning the
+// placeholder is the entire content of a string literal. That is the shape a
+// placeholder actually takes in a JSON body, it needs no parser, and for a
+// value with nothing to escape — every hex and base64 signature, and every API
+// key in the fleet today — the output is byte-identical to the old behaviour.
+//
+// Not attempted: understanding the body. A placeholder spliced into the middle
+// of a string, or a body that is JSON-ish but not JSON, gets the raw value.
+// Guessing further would mean parsing every body of every content type, and
+// being wrong there corrupts requests that work today.
+func swapInBody(data []byte, placeholder, value string) []byte {
+	ph := []byte(placeholder)
+	if len(ph) == 0 {
+		return data
+	}
+	raw := []byte(value)
+	escaped := []byte(jsonStringEscape(value))
+	jsonish := looksLikeJSON(data)
+
+	// The scan keeps data whole and carries an absolute position, rather than
+	// reslicing a shrinking remainder. The test is on the byte BEFORE an
+	// occurrence, and a loop that reslices its input loses the ability to
+	// address that byte for every match after the first.
+	out := make([]byte, 0, len(data))
+	pos := 0
+	for {
+		i := bytes.Index(data[pos:], ph)
+		if i < 0 {
+			return append(out, data[pos:]...)
+		}
+		start, end := pos+i, pos+i+len(ph)
+		out = append(out, data[pos:start]...)
+		if jsonish && start > 0 && data[start-1] == '"' && end < len(data) && data[end] == '"' {
+			out = append(out, escaped...)
+		} else {
+			out = append(out, raw...)
+		}
+		pos = end
+	}
+}
+
+// looksLikeJSON reports whether data opens as a JSON object or array.
+//
+// A cheap gate rather than a parse. It exists to keep the escaping away from
+// bodies that are not JSON at all — a form-encoded or templated body can
+// contain a quoted placeholder too, and escaping there would corrupt a request
+// that works today. A body that opens with { or [ and is not JSON is not
+// something this transform can serve correctly either way.
+func looksLikeJSON(data []byte) bool {
+	t := bytes.TrimLeft(data, " \t\r\n")
+	return len(t) > 0 && (t[0] == '{' || t[0] == '[')
+}
+
+// jsonStringEscape renders v as it must appear INSIDE a JSON string literal —
+// the encoding of the value, without the surrounding quotes, which the body
+// already has.
+//
+// encoding/json rather than hand-rolled: the cases that matter beyond the
+// quote and the backslash are control characters and invalid UTF-8, and those
+// are where a hand-rolled escaper is wrong in a way nothing notices until a
+// venue rejects a request.
+func jsonStringEscape(v string) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	// The default escapes <, > and & as \u003c and friends. Valid, and every
+	// parser decodes it back the same — but it turns a readable signature into
+	// something nobody can match against a packet capture, and this value is
+	// read by whoever is debugging the venue's rejection.
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		// Unreachable for a string, and falling back to the raw value keeps
+		// the old behaviour rather than dropping the substitution.
+		return v
+	}
+	out := bytes.TrimRight(buf.Bytes(), "\n")
+	if len(out) < 2 {
+		return v
+	}
+	return string(out[1 : len(out)-1])
 }

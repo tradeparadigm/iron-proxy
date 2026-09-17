@@ -263,3 +263,132 @@ func rejectionHost(req *http.Request) string {
 	}
 	return host
 }
+
+// signPayloadAbsentBody explains a refusal caused by a request reaching a host
+// with a signing credential without the bytes to sign.
+//
+// THE LONGEST BODY IN THIS FILE, on purpose. Sign mode asks more of the caller
+// than the other two modes do — inject needs nothing at all, replace needs one
+// placeholder, and this needs a placeholder AND a separate header carrying
+// bytes in a form the scheme dictates. An agent has no way to discover any of
+// that: it cannot read the config, the credential's settings page, or this
+// code. So the refusal is the documentation, and it states the whole call
+// rather than only the part that was missing.
+func signPayloadAbsentBody(host, why string, sec *resolvedSecret) string {
+	if sec.label == "" {
+		// No label means no payload header, which means there is no correct
+		// way to make this call. Saying how would be a lie.
+		return paragraphs(
+			"403 Forbidden — refused by the DIME credential proxy.",
+			fmt.Sprintf("This request was NOT sent to %s. %s", host, why),
+			"NOTHING ABOUT THIS REQUEST CAUSED THIS, and changing the request cannot fix it. "+
+				"Stop and report it — the credential needs attention in DIME Terminal settings.")
+	}
+
+	header := signPayloadHeader(sec.label)
+	parts := []string{
+		"403 Forbidden — refused by the DIME credential proxy.",
+		fmt.Sprintf("This request was NOT sent to %s. That host has %s, which is a SIGNING KEY: the "+
+			"proxy signs bytes on this agent's behalf and writes the signature into the request. "+
+			"%s", host, named(sec.label), why),
+		"HOW TO MAKE THIS CALL. Both steps are required; either one alone is refused.",
+		fmt.Sprintf("Step 1 — hand over the bytes to sign. %s Base64-encode them and send them in "+
+			"this request header:", schemeExpectation(sec.scheme)),
+		"    " + header + ": <base64 of the bytes to sign>",
+		"The proxy REMOVES that header before forwarding, so the destination never sees what was " +
+			"signed.",
+	}
+	if sec.proxyValue != "" {
+		parts = append(parts,
+			"Step 2 — mark where the signature goes. Put this exact string where the signature "+
+				"belongs in the request:",
+			"    "+sec.proxyValue,
+			fmt.Sprintf("The proxy replaces it with the signature, rendered as %s.",
+				encodingDescription(sec.encoding)))
+	}
+	parts = append(parts,
+		"Where the proxy looks for that string:",
+		bulletList(placeholderLocations(sec)))
+	parts = append(parts,
+		"The private key itself is never available to this agent and is not needed. Do NOT sign "+
+			"with a key of your own, do NOT put the key's name or any value of your own where the "+
+			"signature belongs, and do not retry this request unchanged — it will be refused again "+
+			"for the same reason.")
+	return paragraphs(parts...)
+}
+
+// signPlaceholderAbsentBody explains a refusal caused by a sign-mode request
+// that handed over the bytes to sign but never said where the signature goes.
+//
+// Separate from placeholderAbsentBody because that one describes replace mode:
+// it tells the caller the proxy will substitute "the real credential", which
+// for a signing key is not what happens and not what the caller should be
+// looking for. The agent is half-right at this point — step 1 worked — and the
+// body says so, because "was my payload accepted?" is otherwise unanswerable
+// and an agent that cannot tell will go back and change the part that was fine.
+func signPlaceholderAbsentBody(host, label string, sec *resolvedSecret) string {
+	parts := []string{
+		"403 Forbidden — refused by the DIME credential proxy.",
+		fmt.Sprintf("This request was NOT sent to %s. The bytes to sign WERE received and are "+
+			"fine — %s is a signing key, and the proxy is ready to sign with it. What is missing "+
+			"is where to put the result: the request contains no placeholder marking the spot, so "+
+			"there is nowhere for the signature to go.", host, named(label)),
+	}
+	if sec.proxyValue != "" {
+		parts = append(parts,
+			"Put this exact string where the signature belongs, keep the sign header you already "+
+				"sent, and retry:",
+			"    "+sec.proxyValue,
+			fmt.Sprintf("The proxy replaces it with the signature, rendered as %s.",
+				encodingDescription(sec.encoding)))
+	}
+	parts = append(parts,
+		"Where the proxy looks for that string:",
+		bulletList(placeholderLocations(sec)))
+	parts = append(parts,
+		"Nothing else about this request needs to change. The private key is never available to "+
+			"this agent and is not needed. Do NOT sign with a key of your own, and do NOT put a "+
+			"value of your own where the signature belongs — only the placeholder above is "+
+			"substituted.")
+	return paragraphs(parts...)
+}
+
+// signLimitBody explains a refusal caused by one request asking for more
+// signatures than a request is allowed to produce.
+//
+// Reachable only when many signing credentials match one host, so it is aimed
+// at the operator as much as the agent: the agent is told plainly that
+// retrying will not help, because nothing about the request's content is what
+// tripped the limit.
+func signLimitBody(host string) string {
+	return paragraphs(
+		"403 Forbidden — refused by the DIME credential proxy.",
+		fmt.Sprintf("This request was NOT sent to %s. It matched more signing credentials than one "+
+			"request may use — this proxy signs at most %d times per request — so it was refused "+
+			"rather than turned into a bulk signing operation.", host, maxSignsPerRequest),
+		"Splitting the work across several requests will not help: the limit counts the credentials "+
+			"CONFIGURED for this host, not anything this request contains. Stop and report it — the "+
+			"credentials for this host need attention in DIME Terminal settings.")
+}
+
+// signFailedBody explains a refusal caused by the signature itself failing to
+// compute.
+//
+// The signing error is SAFE TO HAND BACK, unlike a fetch error. It names the
+// scheme and the shape of input that scheme wanted, and nothing about the key:
+// signPayload is written so that its failures describe the caller's bytes, not
+// the secret. That matters, because the commonest failure here — a message
+// where a digest was expected — is entirely the caller's to fix, and a refusal
+// that hid the reason would leave it guessing.
+func signFailedBody(host, scheme string, err error) string {
+	return paragraphs(
+		"403 Forbidden — refused by the DIME credential proxy.",
+		fmt.Sprintf("This request was NOT sent to %s. The proxy held the signing key and the bytes "+
+			"to sign, but could not produce a signature:", host),
+		"    "+err.Error(),
+		schemeExpectation(scheme),
+		"Correct the bytes handed over in the sign header and retry. If they are already correct "+
+			"for this scheme, stop and report it rather than retrying — the key may be stored in a "+
+			"form this scheme cannot use, which is fixed in DIME Terminal settings. Do NOT sign "+
+			"with a key of your own.")
+}

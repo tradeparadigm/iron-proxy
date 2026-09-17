@@ -451,7 +451,7 @@ func TestSecrets_ConfigErrors(t *testing.T) {
 				Source: envSource("OPENAI_API_KEY"),
 				Rules:  []hostmatch.RuleConfig{{Host: "example.com"}},
 			}}},
-			errMsg: "must specify either inject or replace",
+			errMsg: "must specify inject, replace or sign",
 		},
 		{
 			name: "unsupported source type",
@@ -1190,7 +1190,7 @@ func TestInject_ConfigErrors(t *testing.T) {
 				Replace: &replaceConfig{ProxyValue: "tok"},
 				Rules:   []hostmatch.RuleConfig{{Host: "example.com"}},
 			}}},
-			errMsg: "cannot specify both inject and replace",
+			errMsg: "cannot specify more than one of inject, replace and sign",
 		},
 		{
 			name: "inject with both header and query_param",
