@@ -92,10 +92,33 @@ func signPayload(scheme, key string, payload []byte) ([]byte, error) {
 		return sig, nil
 
 	case schemeHMACSHA256:
-		k, err := base64.StdEncoding.DecodeString(strings.TrimSpace(key))
-		if err != nil {
-			return nil, errors.New("hmac key is not valid base64")
-		}
+		// THE STORED VALUE IS THE KEY, used verbatim. It was base64-decoded
+		// once, and that was wrong in the one way that cannot be noticed.
+		//
+		// Venues do not issue byte blobs — Binance, Bybit and OKX all issue
+		// printable alphanumeric secrets, and the bytes to MAC with are those
+		// characters. Decoding first only works if the operator remembers to
+		// re-encode, and failing to is not a loud error: base64's alphabet
+		// contains every alphanumeric character, so a secret whose length is a
+		// multiple of 4 IS valid base64 and decodes cleanly to three-quarters
+		// as many bytes of unrelated data. The MAC is then computed over the
+		// wrong key, the venue reports only that the signature is bad, and
+		// nothing on either side names the encoding. A real 36-character Bybit
+		// secret does exactly this, and 36 is the length Bybit issues.
+		//
+		// So the decode turned a correct paste into a wrong answer, silently,
+		// for the default shape of the credential this scheme exists to serve.
+		// Every other branch here fails loudly on a bad key; this one is now
+		// the only one with nothing to get wrong.
+		//
+		// The cost is a key that is genuinely binary, which no venue on the
+		// list issues. If one ever does, it wants an explicit per-credential
+		// encoding rather than a rule every caller has to remember.
+		//
+		// Trimmed because a trailing newline from a paste is otherwise exactly
+		// the silent failure just described, and no venue's secret carries
+		// meaningful surrounding whitespace.
+		k := []byte(strings.TrimSpace(key))
 		defer zeroise(k)
 		if len(k) == 0 {
 			return nil, errors.New("hmac key is empty")

@@ -192,7 +192,7 @@ func TestSignPayload_HMACMatchesTheStandard(t *testing.T) {
 	key := []byte("a shared secret of some length")
 	message := []byte("the whole canonical message, unhashed")
 
-	got, err := signPayload(schemeHMACSHA256, base64.StdEncoding.EncodeToString(key), message)
+	got, err := signPayload(schemeHMACSHA256, string(key), message)
 	require.NoError(t, err)
 
 	mac := hmac.New(sha256.New, key)
@@ -200,11 +200,50 @@ func TestSignPayload_HMACMatchesTheStandard(t *testing.T) {
 	require.Equal(t, mac.Sum(nil), got)
 }
 
+// THE STORED SECRET IS THE KEY, and this is the test that says a venue secret
+// which happens to be valid base64 is NOT decoded.
+//
+// Bybit issues 36-character alphanumeric secrets. 36 is a multiple of 4 and
+// every alphanumeric character is in base64's alphabet, so such a secret
+// decodes cleanly to 27 bytes of unrelated data — no error, no warning, and a
+// MAC over the wrong key that only the venue rejects. That was the behaviour
+// here until this commit, so the case is pinned rather than left implied.
+func TestSignPayload_HMACDoesNotDecodeASecretThatLooksLikeBase64(t *testing.T) {
+	secret := "k7Rm2xQ9vBn4rTz8wLpAeF3jHs6dYu1Nc5Gt" // 36 chars, alphanumeric
+	require.Len(t, secret, 36)
+	require.Zero(t, len(secret)%4, "the shape that makes the old bug silent")
+	decoded, err := base64.StdEncoding.DecodeString(secret)
+	require.NoError(t, err, "it really is valid base64, which is the whole trap")
+	require.Len(t, decoded, 27)
+
+	got, err := signPayload(schemeHMACSHA256, secret, []byte("canonical"))
+	require.NoError(t, err)
+
+	want := hmac.New(sha256.New, []byte(secret))
+	want.Write([]byte("canonical"))
+	require.Equal(t, want.Sum(nil), got, "the secret's own bytes, not its base64 decoding")
+
+	wrong := hmac.New(sha256.New, decoded)
+	wrong.Write([]byte("canonical"))
+	require.NotEqual(t, wrong.Sum(nil), got, "and emphatically not the decoded bytes")
+}
+
+// Surrounding whitespace is trimmed, because a trailing newline off a paste is
+// otherwise the same silent wrong-key failure in a different costume.
+func TestSignPayload_HMACTrimsSurroundingWhitespace(t *testing.T) {
+	got, err := signPayload(schemeHMACSHA256, "  a-secret\n", []byte("m"))
+	require.NoError(t, err)
+
+	want := hmac.New(sha256.New, []byte("a-secret"))
+	want.Write([]byte("m"))
+	require.Equal(t, want.Sum(nil), got)
+}
+
 // TestSignPayload_HMACCoversWholeMessages asserts the half of the split that
 // the ECDSA test cannot: a MAC must NOT impose a length, because the message
 // it covers is whatever the venue will verify.
 func TestSignPayload_HMACCoversWholeMessages(t *testing.T) {
-	key := base64.StdEncoding.EncodeToString([]byte("k"))
+	key := "k"
 	for _, n := range []int{1, 31, 32, 33, 4096} {
 		sig, err := signPayload(schemeHMACSHA256, key, make([]byte, n))
 		require.NoError(t, err, "a MAC has no input-length requirement, %d bytes", n)
@@ -213,9 +252,12 @@ func TestSignPayload_HMACCoversWholeMessages(t *testing.T) {
 }
 
 func TestSignPayload_HMACRejectsBadKeys(t *testing.T) {
+	// Only emptiness is left to reject: any other byte string is a usable MAC
+	// key, which is precisely why the decode had to go — it was inventing a
+	// validity rule the scheme does not have.
 	for name, tc := range map[string]struct{ key, want string }{
-		"not base64": {"not base 64 at all!", "not valid base64"},
-		"empty":      {"", "is empty"},
+		"empty":           {"", "is empty"},
+		"only whitespace": {"   \n", "is empty"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := signPayload(schemeHMACSHA256, tc.key, []byte("m"))
@@ -423,9 +465,10 @@ func TestSign_EndToEnd(t *testing.T) {
 // TestSign_HMACEndToEnd covers the other half of the split end to end, since
 // the value substituted differs in both length and meaning.
 func TestSign_HMACEndToEnd(t *testing.T) {
+	// Stored as the venue gives it, which is what an operator pastes.
 	key := []byte("shared secret")
 	s := makeSignSecrets(t,
-		map[string]string{"VENUE_KEY": base64.StdEncoding.EncodeToString(key)},
+		map[string]string{"VENUE_KEY": string(key)},
 		[]secretEntry{signEntry(t, "VENUE_KEY", "venue", schemeHMACSHA256,
 			func(c *signConfig) { c.Encoding = encodingBase64 })})
 
@@ -445,7 +488,7 @@ func TestSign_HMACEndToEnd(t *testing.T) {
 // scan rather than reimplementing it — the reason the two configs share field
 // names in the first place.
 func TestSign_SubstitutesInEveryConfiguredPosition(t *testing.T) {
-	key := base64.StdEncoding.EncodeToString([]byte("k"))
+	const key = "k"
 	s := makeSignSecrets(t,
 		map[string]string{"VENUE_KEY": key},
 		[]secretEntry{signEntry(t, "VENUE_KEY", "venue", schemeHMACSHA256, func(c *signConfig) {
@@ -454,7 +497,7 @@ func TestSign_SubstitutesInEveryConfiguredPosition(t *testing.T) {
 		})})
 
 	message := []byte("m")
-	mac := hmac.New(sha256.New, []byte("k"))
+	mac := hmac.New(sha256.New, []byte(key))
 	mac.Write(message)
 	want := hex.EncodeToString(mac.Sum(nil))
 
@@ -982,7 +1025,7 @@ func TestSwapInBody_ProducesParseableJSON(t *testing.T) {
 // signature inside a JSON body. The two need different renderings of the same
 // encoding, and the position decides which.
 func TestSign_ParadexShape(t *testing.T) {
-	key := base64.StdEncoding.EncodeToString([]byte("stand-in for the stark key"))
+	const key = "stand-in for the stark key"
 	s := makeSignSecrets(t,
 		map[string]string{"PARADEX_KEY": key},
 		// One entry, scanning headers AND the body, as a Paradex credential
@@ -993,7 +1036,7 @@ func TestSign_ParadexShape(t *testing.T) {
 		})})
 
 	sigFor := func(payload []byte) string {
-		mac := hmac.New(sha256.New, []byte("stand-in for the stark key"))
+		mac := hmac.New(sha256.New, []byte(key))
 		mac.Write(payload)
 		out, err := encodeSignature(encodingFeltPair, mac.Sum(nil))
 		require.NoError(t, err)
