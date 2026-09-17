@@ -346,6 +346,11 @@ func main() {
 	logger.Info("iron-proxy stopped")
 }
 
+// initialSyncTimeout bounds the blocking first sync. Long enough to ride out a
+// control-plane restart, short enough that a pod still becomes ready and starts
+// serving — with the poller supplying config as soon as it can.
+const initialSyncTimeout = 30 * time.Second
+
 // initManaged registers with the control plane, performs an initial sync, builds
 // the initial pipeline and MCP policy, and starts the config poller. The poller
 // runs until ctx is canceled and sends fatal errors on errc. Returns the
@@ -360,8 +365,15 @@ func initManaged(ctx context.Context, cfg *config.Config, bodyLimits transform.B
 
 	client := controlplane.NewClient(cpURL, proxyToken, logger)
 
-	// Initial sync.
-	syncResp, err := client.Sync(ctx, "")
+	// Initial sync, BOUNDED. Sync retries a 5xx forever, and none of the
+	// servers start until this returns — so on an unbounded call a control
+	// plane that is merely down means the proxy never binds, fails its
+	// liveness probe, and crashloops until someone fixes the control plane.
+	// The warn below already says the intended behaviour is to carry on and
+	// retry in the background; the timeout is what makes it reachable.
+	syncCtx, cancelSync := context.WithTimeout(ctx, initialSyncTimeout)
+	defer cancelSync()
+	syncResp, err := client.Sync(syncCtx, "")
 	if err != nil {
 		var apiErr *controlplane.APIError
 		if errors.As(err, &apiErr) && apiErr.Code == controlplane.ErrProxyRevoked {
