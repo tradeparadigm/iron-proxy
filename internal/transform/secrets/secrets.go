@@ -195,6 +195,23 @@ type jsonKeyHint struct {
 	JSONKey string `yaml:"json_key"`
 }
 
+// labelHint peeks at the optional label field, common to every source type.
+//
+// SIGN MODE REQUIRES A LABEL — it is the suffix of the X-Dime-Sign-<label>
+// header the caller sends — and until now only the DIME kms_sm source carried
+// one, because it derives the label from the credential it opens. That made
+// signing impossible to exercise on an `env` or `file` source: the two anyone
+// can use on a laptop or in CI, and this repo runs no CI on pull requests, so
+// the whole path had no way to be driven end to end without a provisioned KMS
+// key and Secrets Manager entry.
+//
+// Naming the label in config fakes only WHERE THE SECRET COMES FROM. Key
+// parsing, the scheme dispatch, the encoding, the substitution and every
+// refusal stay the real code. That is the part worth being able to run.
+type labelHint struct {
+	Label string `yaml:"label"`
+}
+
 // resolveSource dispatches a source config through the registry and applies
 // the optional json_key extraction, which is available to every source type.
 func resolveSource(registry sourceBuilderRegistry, node yaml.Node) (secretSource, error) {
@@ -219,6 +236,22 @@ func resolveSource(registry sourceBuilderRegistry, node yaml.Node) (secretSource
 	}
 	if jk.JSONKey != "" {
 		src = &jsonKeySource{inner: src, key: jk.JSONKey}
+	}
+
+	// OUTSIDE the json_key wrapper, because sourceLabel asserts on the
+	// outermost value and jsonKeySource carries no Label of its own.
+	//
+	// Only when the source has not already named itself. kms_sm reads this
+	// same key and requires it — the label is half the envelope's AAD — so the
+	// two cannot disagree; the guard is here so a labelled source is not
+	// wrapped in a second label, which would leave two places to look when an
+	// AAD mismatch has to be explained.
+	var lh labelHint
+	if err := node.Decode(&lh); err != nil {
+		return nil, fmt.Errorf("parsing label: %w", err)
+	}
+	if lh.Label != "" && sourceLabel(src) == "" {
+		src = labeledSource{Source: src, label: lh.Label}
 	}
 	return src, nil
 }

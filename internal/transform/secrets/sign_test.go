@@ -26,6 +26,7 @@ import (
 	"github.com/ironsh/iron-proxy/internal/transform"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 // ---------------------------------------------------------------------------
@@ -319,6 +320,66 @@ func TestPayloadDigest(t *testing.T) {
 // TestSign_EndToEnd is the whole feature in one test: the agent writes a
 // placeholder and hands over bytes, and what leaves the proxy is a signature
 // over exactly those bytes, in the right place, with the payload gone.
+// AN ORDINARY SOURCE CAN CARRY A LABEL, which is what makes sign mode
+// runnable off AWS.
+//
+// Sign mode needs a label — it is the suffix of the payload header — and only
+// kms_sm used to have one, so signing could not be exercised on an env or file
+// source at all. Every test in this file worked around it with a synthetic
+// `labeled_env` builder, which proves the signer and proves nothing about
+// whether a real config can reach it.
+func TestResolveSource_LabelOnAnOrdinarySource(t *testing.T) {
+	reg := testRegistry()
+
+	node := func(t *testing.T, y string) yaml.Node {
+		t.Helper()
+		var n yaml.Node
+		require.NoError(t, yaml.Unmarshal([]byte(y), &n))
+		require.NotEmpty(t, n.Content)
+		return *n.Content[0]
+	}
+
+	t.Run("an env source takes the label from config", func(t *testing.T) {
+		src, err := resolveSource(reg, node(t, "type: env\nvar: OPENAI_API_KEY\nlabel: paradex-testnet-priv-key\n"))
+		require.NoError(t, err)
+		assert.Equal(t, "paradex-testnet-priv-key", sourceLabel(src))
+	})
+
+	t.Run("no label field leaves the source nameless", func(t *testing.T) {
+		src, err := resolveSource(reg, node(t, "type: env\nvar: OPENAI_API_KEY\n"))
+		require.NoError(t, err)
+		assert.Equal(t, "", sourceLabel(src),
+			"so sign mode still refuses it at load, which is the existing guard")
+	})
+
+	t.Run("a source that labels itself is not wrapped again", func(t *testing.T) {
+		// kms_sm reads the SAME "label" key and requires it, because the label
+		// is half the envelope's AAD. So the two can never disagree — but the
+		// generic wrapper must still stand aside rather than wrap a labelled
+		// source in a second label, which would leave two places to look when
+		// an AAD mismatch has to be explained.
+		reg := testRegistry()
+		reg["labeled_env"] = &labeledFakeBuilder{inner: reg["env"].(*fakeBuilder)}
+		src, err := resolveSource(reg, node(t, "type: labeled_env\nvar: OPENAI_API_KEY\nlabel: paradex-mainnet-priv-key\n"))
+		require.NoError(t, err)
+		assert.Equal(t, "paradex-mainnet-priv-key", sourceLabel(src))
+
+		outer, wrapped := src.(labeledSource)
+		if wrapped {
+			_, twice := outer.Source.(labeledSource)
+			assert.False(t, twice, "the builder already labelled it")
+		}
+	})
+
+	t.Run("the label survives the json_key wrapper", func(t *testing.T) {
+		// sourceLabel asserts on the OUTERMOST value, so the ordering of the
+		// two wrappers is load-bearing rather than incidental.
+		src, err := resolveSource(reg, node(t, "type: env\nvar: OPENAI_API_KEY\njson_key: secret\nlabel: binance\n"))
+		require.NoError(t, err)
+		assert.Equal(t, "binance", sourceLabel(src))
+	})
+}
+
 func TestSign_EndToEnd(t *testing.T) {
 	k := newP256Key(t)
 	s := makeSignSecrets(t,
