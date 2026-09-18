@@ -61,9 +61,19 @@ type replaceConfig struct {
 // replace's and deliberately spelled the same, because finding the placeholder
 // IS the same operation — only the substituted value differs.
 type signConfig struct {
-	ProxyValue   string   `yaml:"proxy_value"`
-	Scheme       string   `yaml:"scheme"`
-	Encoding     string   `yaml:"encoding,omitempty"`
+	ProxyValue string `yaml:"proxy_value"`
+	Scheme     string `yaml:"scheme"`
+	Encoding   string `yaml:"encoding,omitempty"`
+	// KeyEncoding says how the STORED secret becomes key bytes: "raw" (the
+	// characters verbatim) or "base64" (decode first). ABSENT MEANS RAW, and
+	// that default is load-bearing rather than convenient — every signing
+	// credential written before this field existed omits it and signs
+	// correctly, so changing what absence means would reinterpret all of them
+	// at once, silently.
+	//
+	// Not the same field as Encoding, which is about the signature going back;
+	// Paradigm base64-decodes the key AND base64-encodes the signature.
+	KeyEncoding  string   `yaml:"key_encoding,omitempty"`
 	MatchHeaders []string `yaml:"match_headers,omitempty"`
 	MatchBody    bool     `yaml:"match_body,omitempty"`
 	MatchPath    bool     `yaml:"match_path,omitempty"`
@@ -101,8 +111,9 @@ type resolvedSecret struct {
 
 	// sign mode fields. The scan fields above are shared with replace; these
 	// two say what to substitute rather than where.
-	scheme   string
-	encoding string
+	scheme      string
+	encoding    string
+	keyEncoding string
 	// label names the payload header the caller hands the bytes over in. Read
 	// off the source rather than configured, so the two sides cannot disagree
 	// about it.
@@ -319,6 +330,7 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 				proxyValue:   sign.ProxyValue,
 				scheme:       sign.Scheme,
 				encoding:     sign.Encoding,
+				keyEncoding:  sign.KeyEncoding,
 				matchHeaders: matchers,
 				matchBody:    sign.MatchBody,
 				matchPath:    sign.MatchPath,
@@ -430,7 +442,7 @@ func validateSign(i int, cfg *signConfig) error {
 		return fmt.Errorf("secrets[%d]: sign.proxy_value is required", i)
 	}
 	switch cfg.Scheme {
-	case schemeHMACSHA256, schemeECDSAP256, schemeStark:
+	case schemeHMACSHA256, schemeHMACSHA512, schemeECDSAP256, schemeStark:
 	case "":
 		return fmt.Errorf("secrets[%d]: sign.scheme is required", i)
 	default:
@@ -440,6 +452,29 @@ func validateSign(i int, cfg *signConfig) error {
 	case encodingHex, encodingBase64, encodingFeltPair, "":
 	default:
 		return fmt.Errorf("secrets[%d]: unknown sign.encoding %q", i, cfg.Encoding)
+	}
+	// Checked at load like the two above, and it is the one where a load-time
+	// refusal is worth the most: a key encoding the signer cannot dispatch on
+	// is not an entry that signs badly, it is an entry that refuses every
+	// request to the host — indistinguishable from an outage, and only visible
+	// once real traffic arrives.
+	//
+	// "" is accepted and means raw. See signConfig.KeyEncoding.
+	switch cfg.KeyEncoding {
+	case keyEncodingRaw, keyEncodingBase64, "":
+	default:
+		return fmt.Errorf("secrets[%d]: unknown sign.key_encoding %q (want %q or %q) — this says how "+
+			"the STORED key is written, not how the signature is written back",
+			i, cfg.KeyEncoding, keyEncodingRaw, keyEncodingBase64)
+	}
+	// An asymmetric scheme has no use for it: an EC key arrives as PEM and a
+	// stark key as a hex scalar, both with their own containers, and neither
+	// goes near hmacKey. Accepting it there would store a fact about the
+	// credential that nothing reads, which is the shape that makes the next
+	// reader believe something untrue.
+	if cfg.KeyEncoding != "" && cfg.Scheme != schemeHMACSHA256 && cfg.Scheme != schemeHMACSHA512 {
+		return fmt.Errorf("secrets[%d]: sign.key_encoding applies to the hmac schemes only; %q reads "+
+			"its key in its own container and ignores it", i, cfg.Scheme)
 	}
 	return nil
 }
@@ -603,7 +638,7 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 				}, nil
 			}
 
-			sig, err := signPayload(sec.scheme, realValue, payload)
+			sig, err := signPayload(sec.scheme, sec.keyEncoding, realValue, payload)
 			if err != nil {
 				// The signing error names the scheme and the shape it wanted,
 				// and none of it is about the key — so unlike a fetch failure
