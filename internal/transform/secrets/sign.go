@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -27,6 +28,11 @@ import (
 // falling back to anything.
 const (
 	schemeHMACSHA256 = "hmac-sha256"
+	// schemeHMACSHA512 is the same MAC over SHA-512. Kraken signs with it and
+	// nothing else here does; no key encoding or signature encoding can stand
+	// in for a different digest, so without the name that venue cannot be
+	// enrolled at all.
+	schemeHMACSHA512 = "hmac-sha512"
 	schemeECDSAP256  = "ecdsa-p256"
 	schemeStark      = "stark"
 )
@@ -36,6 +42,34 @@ const (
 	encodingHex      = "hex"
 	encodingBase64   = "base64"
 	encodingFeltPair = "felt-pair"
+)
+
+// How the STORED KEY is written, which is a different question from the two
+// above: those are about the signature going out, this is about the bytes we
+// MAC with in the first place.
+//
+// It exists because the venues disagree and nothing about a key says which it
+// is. Binance, Bybit and OKX issue a printable secret whose characters ARE the
+// key. Paradigm and Kraken issue the key base64-encoded; Paradigm's documented
+// recipe is
+//
+//	Paradigm-API-Signature: base64(HMAC_SHA256(base64_decode(signing_key), msg))
+//
+// and its own list of 401 causes names forgetting that decode.
+//
+// DECLARED PER CREDENTIAL, NEVER SNIFFED, and the comment in the HMAC branch
+// below is the argument: base64's alphabet contains every alphanumeric
+// character, so a printable secret whose length is a multiple of four is also
+// valid base64 and decodes cleanly to unrelated bytes. Guessing produces a
+// well-formed signature over the wrong key and a venue error that names
+// nothing.
+const (
+	// keyEncodingRaw uses the stored characters as the key bytes. The DEFAULT,
+	// and what an absent key_encoding means — every signing credential written
+	// before this field existed relies on that, so it cannot change.
+	keyEncodingRaw = "raw"
+	// keyEncodingBase64 decodes the stored value first.
+	keyEncodingBase64 = "base64"
 )
 
 // maxSignPayload caps what a single request may hand over to be signed.
@@ -74,7 +108,7 @@ func signPayloadHeader(label string) string {
 // the other's input produces a signature the venue rejects with no indication
 // of why. Refusing here turns that into an error naming the mismatch, which is
 // the difference between a five-minute fix and an afternoon.
-func signPayload(scheme, key string, payload []byte) ([]byte, error) {
+func signPayload(scheme, keyEncoding, key string, payload []byte) ([]byte, error) {
 	switch scheme {
 	case schemeECDSAP256:
 		if len(payload) != sha256.Size {
@@ -91,39 +125,17 @@ func signPayload(scheme, key string, payload []byte) ([]byte, error) {
 		}
 		return sig, nil
 
-	case schemeHMACSHA256:
-		// THE STORED VALUE IS THE KEY, used verbatim. It was base64-decoded
-		// once, and that was wrong in the one way that cannot be noticed.
-		//
-		// Venues do not issue byte blobs — Binance, Bybit and OKX all issue
-		// printable alphanumeric secrets, and the bytes to MAC with are those
-		// characters. Decoding first only works if the operator remembers to
-		// re-encode, and failing to is not a loud error: base64's alphabet
-		// contains every alphanumeric character, so a secret whose length is a
-		// multiple of 4 IS valid base64 and decodes cleanly to three-quarters
-		// as many bytes of unrelated data. The MAC is then computed over the
-		// wrong key, the venue reports only that the signature is bad, and
-		// nothing on either side names the encoding. A real 36-character Bybit
-		// secret does exactly this, and 36 is the length Bybit issues.
-		//
-		// So the decode turned a correct paste into a wrong answer, silently,
-		// for the default shape of the credential this scheme exists to serve.
-		// Every other branch here fails loudly on a bad key; this one is now
-		// the only one with nothing to get wrong.
-		//
-		// The cost is a key that is genuinely binary, which no venue on the
-		// list issues. If one ever does, it wants an explicit per-credential
-		// encoding rather than a rule every caller has to remember.
-		//
-		// Trimmed because a trailing newline from a paste is otherwise exactly
-		// the silent failure just described, and no venue's secret carries
-		// meaningful surrounding whitespace.
-		k := []byte(strings.TrimSpace(key))
-		defer zeroise(k)
-		if len(k) == 0 {
-			return nil, errors.New("hmac key is empty")
+	case schemeHMACSHA256, schemeHMACSHA512:
+		k, err := hmacKey(keyEncoding, key)
+		if err != nil {
+			return nil, err
 		}
-		mac := hmac.New(sha256.New, k)
+		defer zeroise(k)
+		h := sha256.New
+		if scheme == schemeHMACSHA512 {
+			h = sha512.New
+		}
+		mac := hmac.New(h, k)
 		mac.Write(payload)
 		return mac.Sum(nil), nil
 
@@ -159,6 +171,109 @@ func signPayload(scheme, key string, payload []byte) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unknown signing scheme %q", scheme)
 	}
+}
+
+// hmacKey turns the stored secret into the bytes to MAC with, under the
+// encoding the credential declares.
+//
+// WHY THE ENCODING IS DECLARED RATHER THAN DETECTED. An unconditional decode
+// used to live in the HMAC branch and was removed, because it was wrong in the
+// one way that cannot be noticed. Binance, Bybit and OKX issue printable
+// alphanumeric secrets, and the bytes to MAC with are those characters.
+// Decoding one first is not a loud failure: base64's alphabet contains every
+// alphanumeric character, so a secret whose length is a multiple of 4 IS valid
+// base64 and decodes cleanly to three quarters as many bytes of unrelated data
+// — a real 36-character Bybit secret does exactly that, and 36 is the length
+// Bybit issues. The MAC is then computed over the wrong key, the venue reports
+// only that the signature is bad, and nothing on either side names the
+// encoding.
+//
+// The removal comment said what to do if a venue ever issued a key that really
+// was encoded, and this is it: an explicit per-credential encoding rather than
+// a rule every caller has to remember, or a guess. Paradigm and Kraken are
+// those venues.
+//
+// WHY THE DECODE IS HERE AND NOT UPSTREAM. Storing decoded bytes would be
+// simpler and is a trap. The raw branch below trims, deliberately — a trailing
+// newline from a paste is otherwise exactly the silent wrong signature
+// described above — and that trim is harmless on printable text and
+// destructive on random bytes: measured over 200,000 samples, 4.60% of random
+// 32-byte keys begin or end with an ASCII whitespace byte, roughly one in
+// twenty-two, silently truncated and signed wrongly. A consistent failure is
+// debuggable; a one-in-twenty-two failure is not. So the stored value stays the
+// printable text the venue issued, and the decode happens here, once, where the
+// encoding is known.
+//
+// A DECLARED-BASE64 KEY THAT WILL NOT DECODE IS AN ERROR, never a fall back to
+// verbatim. Falling back would recreate exactly the silent-wrong-signature
+// failure this field exists to remove, and it would do it on the credential
+// whose owner had already said which encoding it was.
+func hmacKey(keyEncoding, key string) ([]byte, error) {
+	// Trimmed before the switch, so both branches see the same string: a
+	// trailing newline from a paste breaks a base64 decode as surely as it
+	// corrupts a raw MAC.
+	trimmed := strings.TrimSpace(key)
+
+	switch keyEncoding {
+	case keyEncodingBase64:
+		// Padded and unpadded, standard and URL-safe. Permissive here cannot
+		// produce a WRONG key the way guessing the encoding can: the alphabets
+		// differ only in two characters, and a string containing neither
+		// decodes identically under all four, while one containing either
+		// fails outright under the alphabets that do not have it. So this
+		// accepts more inputs without ever accepting two readings of one.
+		decoded, err := decodeSignKey(trimmed)
+		if err != nil {
+			return nil, fmt.Errorf("this credential declares a base64-encoded key, and the stored "+
+				"value is not valid base64: %w. Either the key was pasted in some other form, or "+
+				"this credential should be storing it raw — it is NOT re-read as raw here, because "+
+				"MAC-ing with the undecoded characters would produce a signature the venue rejects "+
+				"with no indication of why", err)
+		}
+		if len(decoded) == 0 {
+			return nil, errors.New("this credential declares a base64-encoded key and the stored " +
+				"value decodes to nothing")
+		}
+		return decoded, nil
+
+	case keyEncodingRaw, "":
+		// Empty means raw, and that is not leniency: sign_key_encoding is
+		// nullable in the control plane precisely so that a signing credential
+		// enrolled before the field existed keeps doing what it has always
+		// done. Changing what an absent value means would reinterpret every
+		// one of them at once.
+		k := []byte(trimmed)
+		if len(k) == 0 {
+			return nil, errors.New("hmac key is empty")
+		}
+		return k, nil
+
+	default:
+		// Unreachable through a loaded config — validateSign refuses an unknown
+		// key encoding — and kept because this function is also the one a test
+		// or a hand-built resolvedSecret reaches.
+		return nil, fmt.Errorf("unknown signing key encoding %q", keyEncoding)
+	}
+}
+
+// decodeSignKey accepts standard and URL-safe base64, padded or not, for the
+// reason decodeSignPayload does: the four decoders differ only in the two
+// characters they accept, so trying them in turn widens what is accepted
+// without ever accepting two different readings of the same string.
+func decodeSignKey(raw string) ([]byte, error) {
+	var err error
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		var out []byte
+		if out, err = enc.DecodeString(raw); err == nil {
+			return out, nil
+		}
+	}
+	return nil, err
 }
 
 // feltBytes is the width of a STARK field element on the wire. The curve's
@@ -371,10 +486,10 @@ func schemeExpectation(scheme string) string {
 		return fmt.Sprintf("This credential signs with %s, which covers a %d-byte SHA-256 DIGEST. "+
 			"Hash the canonical message first and send the digest, not the message. The signature "+
 			"comes back as an ASN.1 DER (r,s) pair.", schemeECDSAP256, sha256.Size)
-	case schemeHMACSHA256:
+	case schemeHMACSHA256, schemeHMACSHA512:
 		return fmt.Sprintf("This credential authenticates with %s, which covers the WHOLE MESSAGE. "+
 			"Send the exact canonical bytes the venue will verify — do not hash them first.",
-			schemeHMACSHA256)
+			scheme)
 	case schemeStark:
 		return fmt.Sprintf("This credential signs with %s, which covers ONE FIELD ELEMENT of exactly "+
 			"%d bytes: the typed-data message hash, big-endian. Compute the venue's message hash "+

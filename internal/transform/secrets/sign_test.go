@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -129,7 +130,7 @@ func TestSignPayload_ECDSAVerifies(t *testing.T) {
 	k := newP256Key(t)
 	digest := sha256.Sum256([]byte("the canonical message"))
 
-	sig, err := signPayload(schemeECDSAP256, k.pem, digest[:])
+	sig, err := signPayload(schemeECDSAP256, keyEncodingRaw, k.pem, digest[:])
 	require.NoError(t, err)
 	require.True(t, ecdsa.VerifyASN1(k.pub, digest[:], sig),
 		"the signature must verify under the configured key over the exact digest handed in")
@@ -142,7 +143,7 @@ func TestSignPayload_ECDSAVerifies(t *testing.T) {
 func TestSignPayload_ECDSARefusesAMessage(t *testing.T) {
 	k := newP256Key(t)
 
-	_, err := signPayload(schemeECDSAP256, k.pem, []byte("the canonical message"))
+	_, err := signPayload(schemeECDSAP256, keyEncodingRaw, k.pem, []byte("the canonical message"))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "32-byte digest")
 	require.Contains(t, err.Error(), "hash the message first",
@@ -164,7 +165,7 @@ func TestSignPayload_ECDSARejectsBadKeys(t *testing.T) {
 		"empty":       {"", "not PEM"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := signPayload(schemeECDSAP256, tc.key, digest[:])
+			_, err := signPayload(schemeECDSAP256, keyEncodingRaw, tc.key, digest[:])
 			require.Error(t, err)
 			require.Contains(t, err.Error(), tc.want)
 		})
@@ -180,7 +181,7 @@ func TestSignPayload_ECDSAAcceptsPKCS8(t *testing.T) {
 	pkcs8 := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
 
 	digest := sha256.Sum256([]byte("m"))
-	sig, err := signPayload(schemeECDSAP256, pkcs8, digest[:])
+	sig, err := signPayload(schemeECDSAP256, keyEncodingRaw, pkcs8, digest[:])
 	require.NoError(t, err)
 	require.True(t, ecdsa.VerifyASN1(k.pub, digest[:], sig))
 }
@@ -192,7 +193,7 @@ func TestSignPayload_HMACMatchesTheStandard(t *testing.T) {
 	key := []byte("a shared secret of some length")
 	message := []byte("the whole canonical message, unhashed")
 
-	got, err := signPayload(schemeHMACSHA256, string(key), message)
+	got, err := signPayload(schemeHMACSHA256, keyEncodingRaw, string(key), message)
 	require.NoError(t, err)
 
 	mac := hmac.New(sha256.New, key)
@@ -216,7 +217,7 @@ func TestSignPayload_HMACDoesNotDecodeASecretThatLooksLikeBase64(t *testing.T) {
 	require.NoError(t, err, "it really is valid base64, which is the whole trap")
 	require.Len(t, decoded, 27)
 
-	got, err := signPayload(schemeHMACSHA256, secret, []byte("canonical"))
+	got, err := signPayload(schemeHMACSHA256, keyEncodingRaw, secret, []byte("canonical"))
 	require.NoError(t, err)
 
 	want := hmac.New(sha256.New, []byte(secret))
@@ -231,7 +232,7 @@ func TestSignPayload_HMACDoesNotDecodeASecretThatLooksLikeBase64(t *testing.T) {
 // Surrounding whitespace is trimmed, because a trailing newline off a paste is
 // otherwise the same silent wrong-key failure in a different costume.
 func TestSignPayload_HMACTrimsSurroundingWhitespace(t *testing.T) {
-	got, err := signPayload(schemeHMACSHA256, "  a-secret\n", []byte("m"))
+	got, err := signPayload(schemeHMACSHA256, keyEncodingRaw, "  a-secret\n", []byte("m"))
 	require.NoError(t, err)
 
 	want := hmac.New(sha256.New, []byte("a-secret"))
@@ -245,7 +246,7 @@ func TestSignPayload_HMACTrimsSurroundingWhitespace(t *testing.T) {
 func TestSignPayload_HMACCoversWholeMessages(t *testing.T) {
 	key := "k"
 	for _, n := range []int{1, 31, 32, 33, 4096} {
-		sig, err := signPayload(schemeHMACSHA256, key, make([]byte, n))
+		sig, err := signPayload(schemeHMACSHA256, keyEncodingRaw, key, make([]byte, n))
 		require.NoError(t, err, "a MAC has no input-length requirement, %d bytes", n)
 		require.Len(t, sig, sha256.Size)
 	}
@@ -260,7 +261,7 @@ func TestSignPayload_HMACRejectsBadKeys(t *testing.T) {
 		"only whitespace": {"   \n", "is empty"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := signPayload(schemeHMACSHA256, tc.key, []byte("m"))
+			_, err := signPayload(schemeHMACSHA256, keyEncodingRaw, tc.key, []byte("m"))
 			require.Error(t, err)
 			require.Contains(t, err.Error(), tc.want)
 		})
@@ -268,7 +269,7 @@ func TestSignPayload_HMACRejectsBadKeys(t *testing.T) {
 }
 
 func TestSignPayload_UnknownSchemeRefuses(t *testing.T) {
-	_, err := signPayload("ed25519", "k", []byte("m"))
+	_, err := signPayload("ed25519", keyEncodingRaw, "k", []byte("m"))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), `unknown signing scheme "ed25519"`)
 }
@@ -1109,7 +1110,7 @@ func starkFelt(t *testing.T, dec string) []byte {
 func TestSignPayload_StarkVerifiesTheWayParadexVerifies(t *testing.T) {
 	payload := starkFelt(t, "2846891009026995430665703316224827616914889274105712248413538305735679628177")
 
-	sig, err := signPayload(schemeStark, starkKey, payload)
+	sig, err := signPayload(schemeStark, keyEncodingRaw, starkKey, payload)
 	require.NoError(t, err)
 	require.Len(t, sig, 64, "r||s, each padded to the scalar size")
 
@@ -1160,7 +1161,7 @@ func TestSignPayload_StarkIsLowS(t *testing.T) {
 	half := new(big.Int).Rsh(fr.Modulus(), 1)
 	for i := 0; i < 32; i++ {
 		payload := starkFelt(t, fmt.Sprintf("%d", 1000000007+i))
-		sig, err := signPayload(schemeStark, starkKey, payload)
+		sig, err := signPayload(schemeStark, keyEncodingRaw, starkKey, payload)
 		require.NoError(t, err)
 		s := new(big.Int).SetBytes(sig[32:])
 		require.LessOrEqual(t, s.Cmp(half), 0,
@@ -1173,7 +1174,7 @@ func TestSignPayload_StarkIsLowS(t *testing.T) {
 // "signature" field are both ["<r>","<s>"] as decimal strings.
 func TestSignPayload_StarkRendersAsAFeltPair(t *testing.T) {
 	payload := starkFelt(t, "2846891009026995430665703316224827616914889274105712248413538305735679628177")
-	sig, err := signPayload(schemeStark, starkKey, payload)
+	sig, err := signPayload(schemeStark, keyEncodingRaw, starkKey, payload)
 	require.NoError(t, err)
 
 	out, err := encodeSignature(encodingFeltPair, sig)
@@ -1200,7 +1201,7 @@ func TestSignPayload_StarkRefusesTheWrongInput(t *testing.T) {
 		"too long":        make([]byte, 33),
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := signPayload(schemeStark, starkKey, payload)
+			_, err := signPayload(schemeStark, keyEncodingRaw, starkKey, payload)
 			require.Error(t, err)
 			require.Contains(t, err.Error(), "one field element of exactly 32 bytes")
 			require.Contains(t, err.Error(), "message hash")
@@ -1241,4 +1242,361 @@ func TestParseStarkPrivateKey(t *testing.T) {
 			require.Contains(t, err.Error(), tc.want)
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// key_encoding: how the STORED key becomes key bytes
+// ---------------------------------------------------------------------------
+
+// TestSignPayload_ParadigmKnownAnswer is the test this whole field exists for.
+//
+// The expected value is NOT computed by this file. It was produced in Python
+// from Paradigm's documented recipe —
+//
+//	sig = base64.b64encode(hmac.new(base64.b64decode(key), msg, hashlib.sha256).digest())
+//	msg = b"<timestamp_ms>\nPOST\n<path>\n<body>"
+//
+// — and pasted in as a constant, which is the only version of this test worth
+// having: a signature checked against one this package computes would agree
+// with itself whatever it did.
+//
+// THE SECOND ASSERTION IS THE ONE THAT PROVES THE FIELD. A raw entry over the
+// same key and message must produce a DIFFERENT signature, because that is
+// precisely the failure this change removes — and it is a failure that
+// otherwise announces itself only as the venue saying 401.
+func TestSignPayload_ParadigmKnownAnswer(t *testing.T) {
+	// A 32-byte key as Paradigm issues it: base64 text, stored verbatim.
+	const storedKey = "2Y3nQm1fD8xLr6WvZpKt4UgHjSaCbNeXoIyMuArTlVc="
+	msg := []byte("1700000000000\nPOST\n/v1/rfq\n{\"venue\":\"PRDX\"}")
+
+	// Computed independently, per the recipe above.
+	const wantBase64 = "cVsDpm7NJjFHy8RPwkXavA7QxWR4hYj+lNqgVpN5Nxk="
+
+	sig, err := signPayload(schemeHMACSHA256, keyEncodingBase64, storedKey, msg)
+	require.NoError(t, err)
+	got, err := encodeSignature(encodingBase64, sig)
+	require.NoError(t, err)
+	require.Equal(t, wantBase64, got,
+		"this is the signature Paradigm's own documentation says to send")
+
+	// And the same credential read as raw must NOT produce it. Without this
+	// assertion the test above would pass against a signer that ignored
+	// key_encoding entirely and decoded unconditionally.
+	rawSig, err := signPayload(schemeHMACSHA256, keyEncodingRaw, storedKey, msg)
+	require.NoError(t, err)
+	rawGot, err := encodeSignature(encodingBase64, rawSig)
+	require.NoError(t, err)
+	require.NotEqual(t, wantBase64, rawGot,
+		"a raw entry MACs the key's characters, which is a different and equally well-formed "+
+			"signature — that indistinguishability is the whole reason this field is declared")
+}
+
+// TestSignPayload_RawIsTheDefault pins what an ABSENT key encoding means.
+//
+// Every signing credential stored before this field existed omits it, and the
+// control plane's column is nullable for exactly that reason. If "" ever stops
+// meaning raw, all of them start MAC-ing over base64-decoded garbage at once,
+// and the only symptom is the venue rejecting the signature.
+func TestSignPayload_RawIsTheDefault(t *testing.T) {
+	// Deliberately a secret that IS valid base64, so an accidental decode
+	// would succeed rather than error — the silent case, not the loud one.
+	const secret = "k7Rm2xQ9vBn4rTz8wLpAeF3jHs6dYu1Nc5Gt"
+	msg := []byte("canonical")
+
+	absent, err := signPayload(schemeHMACSHA256, "", secret, msg)
+	require.NoError(t, err)
+	stated, err := signPayload(schemeHMACSHA256, keyEncodingRaw, secret, msg)
+	require.NoError(t, err)
+	require.Equal(t, stated, absent, `an absent key encoding must mean exactly "raw"`)
+
+	want := hmac.New(sha256.New, []byte(secret))
+	want.Write(msg)
+	require.Equal(t, want.Sum(nil), absent, "and raw means the secret's own characters")
+}
+
+// TestSignPayload_Base64KeyWithLeadingWhitespaceByte is the specific hazard
+// that keeps the decode in the proxy rather than in the browser.
+//
+// If the browser decoded and stored raw bytes, the key reaching the raw branch
+// would be a binary blob, and that branch trims — deliberately, because a
+// trailing newline off a paste is otherwise a silent wrong signature. Harmless
+// on printable text; destructive on random bytes. Measured over 200,000
+// samples, 4.60% of random 32-byte keys begin or end with an ASCII whitespace
+// byte (the analytic figure is 1-(1-6/256)^2 = 4.63%), so roughly one
+// credential in twenty-two would be silently truncated and sign wrongly.
+//
+// The fixture below is that case made deterministic: its decoded bytes begin
+// with 0x20 and end with 0x0A. Decoding happens AFTER the trim, on the stored
+// base64 text, so those bytes survive.
+func TestSignPayload_Base64KeyWithLeadingWhitespaceByte(t *testing.T) {
+	const storedKey = "IO2/iEZfA63tKasUwlbn2FBWeRo4QyDENJVoctcsiAo="
+	decoded, err := base64.StdEncoding.DecodeString(storedKey)
+	require.NoError(t, err)
+	require.Equal(t, byte(0x20), decoded[0], "the fixture must actually be the hazardous shape")
+	require.Equal(t, byte(0x0a), decoded[len(decoded)-1])
+	require.Len(t, decoded, 32)
+
+	msg := []byte("1700000000000\nPOST\n/v1/rfq\n{}")
+
+	// Computed in Python over the full 32 decoded bytes.
+	const wantBase64 = "6/HPuy8tIcxUXsYdCqNoGeld6rCKlgjFqsCstqhf3TA="
+
+	sig, err := signPayload(schemeHMACSHA256, keyEncodingBase64, storedKey, msg)
+	require.NoError(t, err)
+	got, err := encodeSignature(encodingBase64, sig)
+	require.NoError(t, err)
+	require.Equal(t, wantBase64, got, "all 32 decoded bytes are the key, whitespace bytes included")
+
+	// And emphatically not the 30-byte key a trim of the DECODED bytes would
+	// have produced. This is the one-in-twenty-two silent failure, pinned.
+	truncated := hmac.New(sha256.New, decoded[1:len(decoded)-1])
+	truncated.Write(msg)
+	require.NotEqual(t, truncated.Sum(nil), sig,
+		"trimming decoded bytes is the failure this design avoids by never holding them")
+
+	// The stored TEXT is still trimmed, because a paste's trailing newline is a
+	// real thing and it breaks a base64 decode outright.
+	padded, err := signPayload(schemeHMACSHA256, keyEncodingBase64, "  "+storedKey+"\n", msg)
+	require.NoError(t, err)
+	require.Equal(t, sig, padded, "surrounding whitespace on the STORED value is still noise")
+}
+
+// A declared-base64 key that will not decode must be a loud error. Falling back
+// to verbatim would recreate the silent wrong signature this field exists to
+// remove — and would do it on the one credential whose owner had already said
+// which encoding it was.
+func TestSignPayload_Base64KeyThatWillNotDecodeRefuses(t *testing.T) {
+	// '!' is in no base64 alphabet, so this fails under all four decoders.
+	_, err := signPayload(schemeHMACSHA256, keyEncodingBase64, "not!valid!base64!", []byte("m"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "base64")
+	require.Contains(t, err.Error(), "NOT re-read as raw",
+		"the refusal has to say that it did not silently fall back, because that is the "+
+			"behaviour a reader would otherwise assume")
+}
+
+func TestSignPayload_Base64KeyDecodingToNothingRefuses(t *testing.T) {
+	_, err := signPayload(schemeHMACSHA256, keyEncodingBase64, "", []byte("m"))
+	require.Error(t, err)
+}
+
+// Both alphabets and both padding conventions, for decodeSignPayload's reason:
+// a string containing neither '+/' nor '-_' decodes identically under all four,
+// so accepting all four widens what works without ever admitting two readings
+// of one input.
+func TestSignPayload_Base64KeyAcceptsBothAlphabets(t *testing.T) {
+	raw := []byte{0xfb, 0xff, 0xbe, 0x01, 0x02, 0x03}
+	std := base64.StdEncoding.EncodeToString(raw)    // contains '+' and '/'
+	url := base64.RawURLEncoding.EncodeToString(raw) // contains '-' and '_'
+	require.Contains(t, std, "+")
+	require.Contains(t, url, "-")
+
+	want := hmac.New(sha256.New, raw)
+	want.Write([]byte("m"))
+
+	for name, stored := range map[string]string{"std": std, "rawurl": url} {
+		t.Run(name, func(t *testing.T) {
+			sig, err := signPayload(schemeHMACSHA256, keyEncodingBase64, stored, []byte("m"))
+			require.NoError(t, err)
+			require.Equal(t, want.Sum(nil), sig)
+		})
+	}
+}
+
+func TestSignPayload_UnknownKeyEncodingRefuses(t *testing.T) {
+	_, err := signPayload(schemeHMACSHA256, "hex", "abcd", []byte("m"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `unknown signing key encoding "hex"`,
+		"hex is a SIGNATURE encoding; taking it here would MAC over bytes nobody asked for")
+}
+
+// ---------------------------------------------------------------------------
+// hmac-sha512, the other half of Kraken
+// ---------------------------------------------------------------------------
+
+// TestSignPayload_HMACSHA512KnownAnswer: Kraken issues a base64 key AND signs
+// with SHA-512, so the two changes together are what unblock it — either alone
+// leaves the venue unenrollable. Expected value computed in Python.
+func TestSignPayload_HMACSHA512KnownAnswer(t *testing.T) {
+	const storedKey = "dGhpcyBpcyBhIGtyYWtlbiBzdHlsZSBzZWNyZXQga2V5IHZhbHVl"
+	msg := []byte("1700000000000\nPOST\n/0/private/AddOrder\nnonce=1700000000000")
+
+	const wantBase64 = "mpocNFG0zAoJDp2844ZLFxr0Je7e2axdCeoie3KJwZrdCp3NG2WVV2qCmDwnkaLtqRqfm/NC84GyhaoLLaP6MQ=="
+
+	sig, err := signPayload(schemeHMACSHA512, keyEncodingBase64, storedKey, msg)
+	require.NoError(t, err)
+	require.Len(t, sig, sha512.Size, "sha512, not sha256 — the digest width is the whole difference")
+	got, err := encodeSignature(encodingBase64, sig)
+	require.NoError(t, err)
+	require.Equal(t, wantBase64, got)
+}
+
+// The two MAC schemes must not be interchangeable. They share a branch, and a
+// branch that ignored the scheme would pass every other test in this file.
+func TestSignPayload_HMACSHA512DiffersFromSHA256(t *testing.T) {
+	const key = "a shared secret"
+	msg := []byte("m")
+
+	s256, err := signPayload(schemeHMACSHA256, keyEncodingRaw, key, msg)
+	require.NoError(t, err)
+	s512, err := signPayload(schemeHMACSHA512, keyEncodingRaw, key, msg)
+	require.NoError(t, err)
+
+	require.Len(t, s256, sha256.Size)
+	require.Len(t, s512, sha512.Size)
+
+	want := hmac.New(sha512.New, []byte(key))
+	want.Write(msg)
+	require.Equal(t, want.Sum(nil), s512)
+}
+
+// A MAC has no input-length requirement, and that has to hold for the new
+// scheme too: the message it covers is whatever the venue will verify.
+func TestSignPayload_HMACSHA512CoversWholeMessages(t *testing.T) {
+	for _, n := range []int{1, 31, 64, 65, 4096} {
+		sig, err := signPayload(schemeHMACSHA512, keyEncodingRaw, "k", make([]byte, n))
+		require.NoError(t, err, "%d bytes", n)
+		require.Len(t, sig, sha512.Size)
+	}
+}
+
+func TestSignPayload_HMACSHA512RefusalNamesItsOwnScheme(t *testing.T) {
+	require.Contains(t, schemeExpectation(schemeHMACSHA512), schemeHMACSHA512,
+		"a refusal that named the wrong scheme would send the caller to the wrong fix")
+	require.Contains(t, schemeExpectation(schemeHMACSHA512), "WHOLE MESSAGE")
+}
+
+// ---------------------------------------------------------------------------
+// Config-load validation, where a bad value is cheapest to catch
+// ---------------------------------------------------------------------------
+
+// A config that loads and then refuses every request to a credentialed host is
+// indistinguishable from an outage, and worse than a refused config: the proxy
+// keeps serving what it had, so every later credential change silently fails to
+// take. So key_encoding is checked at load, like scheme and encoding.
+func TestValidateSign_KeyEncoding(t *testing.T) {
+	for name, tc := range map[string]struct {
+		scheme, keyEncoding, wantErr string
+	}{
+		"raw":                {schemeHMACSHA256, keyEncodingRaw, ""},
+		"base64":             {schemeHMACSHA256, keyEncodingBase64, ""},
+		"absent means raw":   {schemeHMACSHA256, "", ""},
+		"sha512 with base64": {schemeHMACSHA512, keyEncodingBase64, ""},
+
+		"a signature encoding is not a key encoding": {
+			schemeHMACSHA256, "hex", "unknown sign.key_encoding"},
+		"base64url":  {schemeHMACSHA256, "base64url", "unknown sign.key_encoding"},
+		"mixed case": {schemeHMACSHA256, "BASE64", "unknown sign.key_encoding"},
+
+		// An EC key arrives as PEM and a stark key as a hex scalar; neither
+		// goes near hmacKey, so a key encoding on one is a stored fact nothing
+		// reads — which is how the next reader comes to believe something
+		// untrue about the row.
+		"ecdsa has its own container": {
+			schemeECDSAP256, keyEncodingBase64, "hmac schemes only"},
+		"and so does stark": {
+			schemeStark, keyEncodingBase64, "hmac schemes only"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := validateSign(0, &signConfig{
+				ProxyValue:  "sign-venue-Ab3kQ9zLmNpQ",
+				Scheme:      tc.scheme,
+				KeyEncoding: tc.keyEncoding,
+			})
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+func TestValidateSign_AcceptsHMACSHA512(t *testing.T) {
+	require.NoError(t, validateSign(0, &signConfig{
+		ProxyValue: "sign-venue-Ab3kQ9zLmNpQ", Scheme: schemeHMACSHA512,
+	}))
+}
+
+// ---------------------------------------------------------------------------
+// End to end, through a loaded config
+// ---------------------------------------------------------------------------
+
+// TestSign_Base64KeyEndToEnd proves the field survives YAML, config load and
+// the resolved secret — not only the signer. A key_encoding parsed into
+// nothing would leave every test above passing and every request signing
+// wrongly, which is the drift this asserts against.
+func TestSign_Base64KeyEndToEnd(t *testing.T) {
+	const storedKey = "2Y3nQm1fD8xLr6WvZpKt4UgHjSaCbNeXoIyMuArTlVc="
+	msg := []byte("1700000000000\nPOST\n/v1/rfq\n{\"venue\":\"PRDX\"}")
+	const wantBase64 = "cVsDpm7NJjFHy8RPwkXavA7QxWR4hYj+lNqgVpN5Nxk="
+
+	s := makeSignSecrets(t,
+		map[string]string{"VENUE_KEY": storedKey},
+		[]secretEntry{signEntry(t, "VENUE_KEY", "venue", schemeHMACSHA256, func(c *signConfig) {
+			c.Encoding = encodingBase64
+			c.KeyEncoding = keyEncodingBase64
+		})})
+
+	req := paradexReq(t, msg, "venue")
+	req.Header.Set("X-Signature", "sign-venue-Ab3kQ9zLmNpQ")
+
+	runSign(t, s, req)
+
+	require.Equal(t, wantBase64, req.Header.Get("X-Signature"))
+}
+
+// The same entry with no key_encoding at all must sign as it always has. This
+// is the regression guard for every credential enrolled before the field
+// existed — including the live Binance one this change must not touch.
+func TestSign_AbsentKeyEncodingSignsAsBefore(t *testing.T) {
+	key := []byte("shared secret")
+	s := makeSignSecrets(t,
+		map[string]string{"VENUE_KEY": string(key)},
+		[]secretEntry{signEntry(t, "VENUE_KEY", "venue", schemeHMACSHA256,
+			func(c *signConfig) { c.Encoding = encodingBase64 })})
+
+	message := []byte("GET\n/orders\n1700000000")
+	req := paradexReq(t, message, "venue")
+	req.Header.Set("X-Signature", "sign-venue-Ab3kQ9zLmNpQ")
+
+	runSign(t, s, req)
+
+	mac := hmac.New(sha256.New, key)
+	mac.Write(message)
+	require.Equal(t, base64.StdEncoding.EncodeToString(mac.Sum(nil)),
+		req.Header.Get("X-Signature"))
+}
+
+// A declared-base64 key that will not decode must REFUSE the request rather
+// than sign with the characters. The refusal is the whole point: a fallback
+// here would be a well-formed signature the venue rejects for reasons nothing
+// on this side records.
+func TestSign_Base64KeyThatWillNotDecodeRejectsTheRequest(t *testing.T) {
+	s := makeSignSecrets(t,
+		map[string]string{"VENUE_KEY": "not!valid!base64!"},
+		[]secretEntry{signEntry(t, "VENUE_KEY", "venue", schemeHMACSHA256, func(c *signConfig) {
+			c.KeyEncoding = keyEncodingBase64
+		})})
+
+	req := paradexReq(t, []byte("m"), "venue")
+	req.Header.Set("X-Signature", "sign-venue-Ab3kQ9zLmNpQ")
+
+	body, _ := readRejection(t, s, req)
+	says(t, body, "base64", "what was wrong with the stored key")
+
+	// And the placeholder must NOT have been replaced with anything.
+	require.Equal(t, "sign-venue-Ab3kQ9zLmNpQ", req.Header.Get("X-Signature"))
+}
+
+// key_encoding round-trips through YAML under the name the control plane
+// emits. proxyconfig writes `key_encoding`; a tag that did not match would
+// parse to the zero value, which reads as raw and signs wrongly in silence.
+func TestSignConfig_KeyEncodingParsesFromYAML(t *testing.T) {
+	var cfg signConfig
+	require.NoError(t, yaml.Unmarshal([]byte(
+		"proxy_value: sign-venue-Ab3kQ9zLmNpQ\nscheme: hmac-sha256\nkey_encoding: base64\n"), &cfg))
+	require.Equal(t, keyEncodingBase64, cfg.KeyEncoding)
+	require.Equal(t, schemeHMACSHA256, cfg.Scheme)
 }
